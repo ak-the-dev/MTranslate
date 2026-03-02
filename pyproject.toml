@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtranslate"
+version = "0.1.0"
+description = "Offline-first manga translation pipeline for macOS"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "MTranslate"}]
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+mtranslate = "mtranslate.cli:main"
+
+[tool.setuptools]
+packages = ["mtranslate"]

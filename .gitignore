@@ -1,0 +1,16 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.pyc
+
+.venv/
+.venv_local/
+.mtranslate_data/
+.mtranslate_data_runtime/
+outputs/
+models/
+ui/**/.build/
+ui/**/.swiftpm/
+ui/**/Package.resolved
+
+*.log

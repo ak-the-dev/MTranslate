@@ -1,0 +1,14 @@
+PyYAML>=6.0
+Pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.10
+paddlepaddle>=3.1.1
+paddleocr>=3.2.0
+fastdeploy-python>=1.0.7; python_version < "3.11"
+torch>=2.8.0
+diffusers>=0.36.0
+transformers>=4.57.0
+accelerate>=1.10.0
+safetensors>=0.7.0
+huggingface_hub>=0.36.0
+vllm>=0.14.1

@@ -1,0 +1,13 @@
+characters:
+  キナト: Kinato
+  キナトくん: Kinato
+
+honorific_policy: keep
+
+catchphrases:
+  いきます…: Here goes...
+  いきます: Here goes...
+
+banned_literals:
+  magician: mage
+  sorcerer: mage
