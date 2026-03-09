@@ -27,7 +27,7 @@ MODEL_PROFILES = {
             "runtime": "vllm-mlx",
             "size_gb": 3.0,
             "state": "ready",
-            "notes": "Quantized Gemma 3",
+            "notes": "Example default MLX LLM",
         },
         {
             "id": "sdxl_inpaint",
@@ -35,7 +35,7 @@ MODEL_PROFILES = {
             "runtime": "diffusers",
             "size_gb": 12.0,
             "state": "ready",
-            "notes": "Pony Diffusion V6 XL",
+            "notes": "Example default diffusion infill model",
         },
     ]
 }

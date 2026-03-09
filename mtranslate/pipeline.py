@@ -587,7 +587,10 @@ class PipelineRunner:
         }
         manifest.notes["series_id"] = self.series_id
         manifest.notes["translate_backend"] = (
-            os.getenv("MTRANSLATE_TRANSLATE_BACKEND", "vllm").strip().lower() or "vllm"
+            (os.getenv("MTRANSLATE_LLM_BACKEND") or os.getenv("MTRANSLATE_TRANSLATE_BACKEND") or "vllm")
+            .strip()
+            .lower()
+            or "vllm"
         )
         manifest.notes["inpaint_backend"] = self.inpaint_selection.backend
         if self.pre_dict_path:

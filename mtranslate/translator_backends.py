@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
+import subprocess
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .env import env_bool, env_float, env_int
+from .env import env_float, env_int
 from .paths import models_dir
 
 
@@ -33,11 +36,68 @@ class TranslatorBackend:
 BatchItem = Tuple[int, str, Dict[str, Any]]
 
 
-def _default_translation_model_path() -> str:
-    for env_name in ("MTRANSLATE_VLLM_MODEL", "MTRANSLATE_TRANSLATOR_MODEL"):
-        value = os.getenv(env_name, "").strip()
+def _env_str(names: Sequence[str], default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
         if value:
             return value
+    return default
+
+
+def _env_bool_alias(names: Sequence[str], default: bool = False) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            continue
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _env_int_alias(
+    names: Sequence[str],
+    default: int,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            continue
+        return env_int(name, default, min_value=min_value, max_value=max_value)
+    return env_int("__unused__", default, min_value=min_value, max_value=max_value)
+
+
+def _env_float_alias(
+    names: Sequence[str],
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            continue
+        return env_float(name, default, min_value=min_value, max_value=max_value)
+    value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _default_translation_model_path() -> str:
+    value = _env_str(
+        (
+            "MTRANSLATE_LLM_MODEL",
+            "MTRANSLATE_TRANSLATOR_MODEL",
+            "MTRANSLATE_VLLM_MODEL",
+        )
+    )
+    if value:
+        return value
 
     root = models_dir()
     candidates = [
@@ -52,8 +112,64 @@ def _default_translation_model_path() -> str:
     return "mlx-community/gemma-3-4b-it-qat-4bit"
 
 
+def _default_translation_command() -> str:
+    return _env_str(("MTRANSLATE_LLM_COMMAND", "MTRANSLATE_TRANSLATE_COMMAND"))
+
+
+class _DummyOutput:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _DummyRequestOutput:
+    def __init__(self, text: str) -> None:
+        self.outputs = [_DummyOutput(text)]
+
+
+@dataclass
+class _SimpleSamplingParams:
+    temperature: float
+    top_p: float
+    max_tokens: int
+    repetition_penalty: float
+
+
+class _MLXLMEngine:
+    def __init__(self, model_path: str) -> None:
+        from mlx_lm import load
+
+        self.model, self.tokenizer = load(model_path)
+
+    def generate(self, prompts, sampling_params, use_tqdm=False):
+        from mlx_lm import generate
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        sampler = make_sampler(
+            temp=float(getattr(sampling_params, "temperature", 0.0) or 0.0),
+            top_p=float(getattr(sampling_params, "top_p", 1.0) or 1.0),
+        )
+        repetition_penalty = float(getattr(sampling_params, "repetition_penalty", 1.0) or 1.0)
+        logits_processors = make_logits_processors(
+            repetition_penalty=repetition_penalty if abs(repetition_penalty - 1.0) > 1e-6 else None
+        )
+
+        results = []
+        for prompt in prompts:
+            text = generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                max_tokens=int(getattr(sampling_params, "max_tokens", 256) or 256),
+                verbose=False,
+                sampler=sampler,
+                logits_processors=logits_processors,
+            )
+            results.append(_DummyRequestOutput(text))
+        return results
+
+
 class VLLMTranslatorBackend(TranslatorBackend):
-    """JP->EN translation backend using Gemma 3 via vLLM."""
+    """Translation backend backed by vLLM-compatible models."""
 
     name = "vllm"
 
@@ -85,7 +201,7 @@ class VLLMTranslatorBackend(TranslatorBackend):
     def __init__(self, glossary: Optional[Dict[str, Any]] = None, model_path: str | None = None) -> None:
         self.glossary = glossary or {}
         self.model_path = model_path or _default_translation_model_path()
-        self.vllm_plugin = os.getenv("MTRANSLATE_VLLM_PLUGIN", "").strip()
+        self.vllm_plugin = _env_str(("MTRANSLATE_LLM_PLUGIN", "MTRANSLATE_VLLM_PLUGIN"))
         if self.vllm_plugin:
             os.environ.setdefault("VLLM_PLUGINS", self.vllm_plugin)
         
@@ -96,52 +212,158 @@ class VLLMTranslatorBackend(TranslatorBackend):
 
         plugin_name = (self.vllm_plugin or os.getenv("VLLM_PLUGINS", "")).strip().lower()
 
-        self.temperature = env_float("MTRANSLATE_VLLM_TEMPERATURE", 0.0, min_value=0.0, max_value=2.0)
-        self.top_p = env_float("MTRANSLATE_VLLM_TOP_P", 0.95, min_value=0.0, max_value=1.0)
-        self.max_tokens = env_int("MTRANSLATE_VLLM_MAX_TOKENS", 220, min_value=8, max_value=4096)
-        self.repetition_penalty = env_float("MTRANSLATE_VLLM_REPETITION_PENALTY", 1.02, min_value=0.8, max_value=2.0)
-        self.tensor_parallel_size = env_int("MTRANSLATE_VLLM_TP", 1, min_value=1, max_value=16)
-        self.dtype = os.getenv("MTRANSLATE_VLLM_DTYPE", "auto").strip() or "auto"
-        self.max_model_len = env_int("MTRANSLATE_VLLM_MAX_MODEL_LEN", 0, min_value=0, max_value=131_072)
-        self.gpu_memory_utilization = env_float(
-            "MTRANSLATE_VLLM_GPU_MEMORY_UTIL",
+        self.temperature = _env_float_alias(
+            ("MTRANSLATE_LLM_TEMPERATURE", "MTRANSLATE_VLLM_TEMPERATURE"),
+            0.0,
+            min_value=0.0,
+            max_value=2.0,
+        )
+        self.top_p = _env_float_alias(
+            ("MTRANSLATE_LLM_TOP_P", "MTRANSLATE_VLLM_TOP_P"),
+            0.95,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        self.max_tokens = _env_int_alias(
+            ("MTRANSLATE_LLM_MAX_TOKENS", "MTRANSLATE_VLLM_MAX_TOKENS"),
+            220,
+            min_value=8,
+            max_value=4096,
+        )
+        self.repetition_penalty = _env_float_alias(
+            ("MTRANSLATE_LLM_REPETITION_PENALTY", "MTRANSLATE_VLLM_REPETITION_PENALTY"),
+            1.02,
+            min_value=0.8,
+            max_value=2.0,
+        )
+        self.tensor_parallel_size = _env_int_alias(
+            ("MTRANSLATE_LLM_TP", "MTRANSLATE_VLLM_TP"),
+            1,
+            min_value=1,
+            max_value=16,
+        )
+        self.dtype = _env_str(("MTRANSLATE_LLM_DTYPE", "MTRANSLATE_VLLM_DTYPE"), "auto") or "auto"
+        self.max_model_len = _env_int_alias(
+            ("MTRANSLATE_LLM_MAX_MODEL_LEN", "MTRANSLATE_VLLM_MAX_MODEL_LEN"),
+            0,
+            min_value=0,
+            max_value=131_072,
+        )
+        self.gpu_memory_utilization = _env_float_alias(
+            ("MTRANSLATE_LLM_GPU_MEMORY_UTIL", "MTRANSLATE_VLLM_GPU_MEMORY_UTIL"),
             0.85,
             min_value=0.1,
             max_value=0.99,
         )
 
-        self.context_lines = env_int("MTRANSLATE_VLLM_CONTEXT_LINES", 2, min_value=0, max_value=24)
-        self.context_chars = env_int("MTRANSLATE_VLLM_CONTEXT_CHARS", 260, min_value=64, max_value=2000)
-        self.context_line_chars = env_int("MTRANSLATE_VLLM_CONTEXT_LINE_CHARS", 88, min_value=24, max_value=512)
-        self.min_source_chars_for_context = env_int(
-            "MTRANSLATE_VLLM_MIN_SOURCE_CHARS_FOR_CONTEXT",
+        self.context_lines = _env_int_alias(
+            ("MTRANSLATE_LLM_CONTEXT_LINES", "MTRANSLATE_VLLM_CONTEXT_LINES"),
+            2,
+            min_value=0,
+            max_value=24,
+        )
+        self.context_chars = _env_int_alias(
+            ("MTRANSLATE_LLM_CONTEXT_CHARS", "MTRANSLATE_VLLM_CONTEXT_CHARS"),
+            260,
+            min_value=64,
+            max_value=2000,
+        )
+        self.context_line_chars = _env_int_alias(
+            ("MTRANSLATE_LLM_CONTEXT_LINE_CHARS", "MTRANSLATE_VLLM_CONTEXT_LINE_CHARS"),
+            88,
+            min_value=24,
+            max_value=512,
+        )
+        self.min_source_chars_for_context = _env_int_alias(
+            ("MTRANSLATE_LLM_MIN_SOURCE_CHARS_FOR_CONTEXT", "MTRANSLATE_VLLM_MIN_SOURCE_CHARS_FOR_CONTEXT"),
             6,
             min_value=0,
             max_value=200,
         )
 
         default_batch_enabled = "0" if "vllm_mlx" in plugin_name or "mlx" in plugin_name else "1"
-        self.batch_enabled = env_bool("MTRANSLATE_VLLM_BATCH_ENABLED", default=(default_batch_enabled == "1"))
-        self.batch_size = env_int("MTRANSLATE_VLLM_BATCH_SIZE", 6, min_value=1, max_value=64)
-        self.batch_retries = env_int("MTRANSLATE_VLLM_BATCH_RETRIES", 2, min_value=0, max_value=10)
-        self.batch_split_depth = env_int("MTRANSLATE_VLLM_BATCH_SPLIT_DEPTH", 3, min_value=0, max_value=8)
-        self.region_retries = env_int("MTRANSLATE_VLLM_REGION_RETRIES", 1, min_value=0, max_value=5)
+        self.batch_enabled = _env_bool_alias(
+            ("MTRANSLATE_LLM_BATCH_ENABLED", "MTRANSLATE_VLLM_BATCH_ENABLED"),
+            default=(default_batch_enabled == "1"),
+        )
+        self.batch_size = _env_int_alias(
+            ("MTRANSLATE_LLM_BATCH_SIZE", "MTRANSLATE_VLLM_BATCH_SIZE"),
+            6,
+            min_value=1,
+            max_value=64,
+        )
+        self.batch_retries = _env_int_alias(
+            ("MTRANSLATE_LLM_BATCH_RETRIES", "MTRANSLATE_VLLM_BATCH_RETRIES"),
+            2,
+            min_value=0,
+            max_value=10,
+        )
+        self.batch_split_depth = _env_int_alias(
+            ("MTRANSLATE_LLM_BATCH_SPLIT_DEPTH", "MTRANSLATE_VLLM_BATCH_SPLIT_DEPTH"),
+            3,
+            min_value=0,
+            max_value=8,
+        )
+        self.region_retries = _env_int_alias(
+            ("MTRANSLATE_LLM_REGION_RETRIES", "MTRANSLATE_VLLM_REGION_RETRIES"),
+            1,
+            min_value=0,
+            max_value=5,
+        )
 
-        self.max_glossary_terms = env_int("MTRANSLATE_VLLM_GLOSSARY_MAX_TERMS", 12, min_value=1, max_value=64)
-        self.glossary_fuzzy_max_distance = env_int("MTRANSLATE_VLLM_GLOSSARY_FUZZY_DIST", 2, min_value=0, max_value=5)
+        self.max_glossary_terms = _env_int_alias(
+            ("MTRANSLATE_LLM_GLOSSARY_MAX_TERMS", "MTRANSLATE_VLLM_GLOSSARY_MAX_TERMS"),
+            12,
+            min_value=1,
+            max_value=64,
+        )
+        self.glossary_fuzzy_max_distance = _env_int_alias(
+            ("MTRANSLATE_LLM_GLOSSARY_FUZZY_DIST", "MTRANSLATE_VLLM_GLOSSARY_FUZZY_DIST"),
+            2,
+            min_value=0,
+            max_value=5,
+        )
 
-        self.enable_reasoning = env_bool("MTRANSLATE_VLLM_ENABLE_REASONING", default=True)
-        self.reasoning_model_hint = os.getenv("MTRANSLATE_VLLM_REASONING_MODEL_HINT", "gemma").strip().lower()
-        self.enforce_eager = env_bool("MTRANSLATE_VLLM_ENFORCE_EAGER", default=True)
-        self.trust_remote_code = env_bool("MTRANSLATE_VLLM_TRUST_REMOTE_CODE", default=False)
+        self.enable_reasoning = _env_bool_alias(
+            ("MTRANSLATE_LLM_ENABLE_REASONING", "MTRANSLATE_VLLM_ENABLE_REASONING"),
+            default=True,
+        )
+        self.reasoning_model_hint = _env_str(
+            ("MTRANSLATE_LLM_REASONING_MODEL_HINT", "MTRANSLATE_VLLM_REASONING_MODEL_HINT"),
+            "any",
+        ).lower()
+        self.enforce_eager = _env_bool_alias(
+            ("MTRANSLATE_LLM_ENFORCE_EAGER", "MTRANSLATE_VLLM_ENFORCE_EAGER"),
+            default=True,
+        )
+        self.trust_remote_code = _env_bool_alias(
+            ("MTRANSLATE_LLM_TRUST_REMOTE_CODE", "MTRANSLATE_VLLM_TRUST_REMOTE_CODE"),
+            default=False,
+        )
 
-        self.hallucination_guard = env_bool("MTRANSLATE_VLLM_HALLUCINATION_GUARD", default=True)
-        symbols = os.getenv("MTRANSLATE_VLLM_SUSPICIOUS_SYMBOLS", "ହ,ി,ഹ")
+        self.hallucination_guard = _env_bool_alias(
+            ("MTRANSLATE_LLM_HALLUCINATION_GUARD", "MTRANSLATE_VLLM_HALLUCINATION_GUARD"),
+            default=True,
+        )
+        symbols = _env_str(
+            ("MTRANSLATE_LLM_SUSPICIOUS_SYMBOLS", "MTRANSLATE_VLLM_SUSPICIOUS_SYMBOLS"),
+            "ହ,ി,ഹ",
+        )
         self.suspicious_symbols = [x.strip() for x in symbols.split(",") if x.strip()]
-        self.max_char_expansion = env_float("MTRANSLATE_VLLM_MAX_CHAR_EXPANSION", 8.0, min_value=2.0, max_value=40.0)
+        self.max_char_expansion = _env_float_alias(
+            ("MTRANSLATE_LLM_MAX_CHAR_EXPANSION", "MTRANSLATE_VLLM_MAX_CHAR_EXPANSION"),
+            8.0,
+            min_value=2.0,
+            max_value=40.0,
+        )
 
-        self.debug_translation = env_bool("MTRANSLATE_DEBUG_TRANSLATION", default=False)
-        self.debug_preview_chars = env_int("MTRANSLATE_DEBUG_TRANSLATION_CHARS", 320, min_value=120, max_value=4000)
+        self.debug_translation = _env_bool_alias(("MTRANSLATE_DEBUG_TRANSLATION",), default=False)
+        self.debug_preview_chars = _env_int_alias(
+            ("MTRANSLATE_DEBUG_TRANSLATION_CHARS",),
+            320,
+            min_value=120,
+            max_value=4000,
+        )
         self._debug_events: List[Dict[str, Any]] = []
         self._debug_lock = threading.Lock()
 
@@ -254,49 +476,7 @@ class VLLMTranslatorBackend(TranslatorBackend):
                 # If vLLM fails on macOS/MLX for any reason, fallback to mlx-lm if available
                 # This catches the XFORMERS validation error, segfaults, and other flakes.
                 try:
-                    from mlx_lm import load, generate
-                    from mlx_lm.sample_utils import make_logits_processors, make_sampler
-
-                    class _DummyOutput:
-                        def __init__(self, text: str) -> None:
-                            self.text = text
-
-                    class _DummyRequestOutput:
-                        def __init__(self, text: str) -> None:
-                            self.outputs = [_DummyOutput(text)]
-
-                    class MLXLMAdapter:
-                        def __init__(self, model_path):
-                            self.model, self.tokenizer = load(model_path)
-
-                        def generate(self, prompts, sampling_params, use_tqdm=False):
-                            sampler = make_sampler(
-                                temp=float(getattr(sampling_params, "temperature", 0.0) or 0.0),
-                                top_p=float(getattr(sampling_params, "top_p", 1.0) or 1.0),
-                            )
-                            repetition_penalty = float(
-                                getattr(sampling_params, "repetition_penalty", 1.0) or 1.0
-                            )
-                            logits_processors = make_logits_processors(
-                                repetition_penalty=(
-                                    repetition_penalty if abs(repetition_penalty - 1.0) > 1e-6 else None
-                                )
-                            )
-                            results = []
-                            for p in prompts:
-                                txt = generate(
-                                    self.model,
-                                    self.tokenizer,
-                                    prompt=p,
-                                    max_tokens=int(getattr(sampling_params, "max_tokens", 256) or 256),
-                                    verbose=False,
-                                    sampler=sampler,
-                                    logits_processors=logits_processors,
-                                )
-                                results.append(_DummyRequestOutput(txt))
-                            return results
-
-                    engine = MLXLMAdapter(self.model_path)
+                    engine = _MLXLMEngine(self.model_path)
                     VLLMTranslatorBackend._engine_cache[cache_key] = engine
                     return engine
                 except Exception as mlx_exc:  # noqa: BLE001
@@ -304,11 +484,6 @@ class VLLMTranslatorBackend(TranslatorBackend):
                         f"vLLM initialization failed ({vllm_error}). "
                         f"MLX fallback failed ({mlx_exc})."
                     ) from mlx_exc
-
-                raise RuntimeError(
-                    f"vLLM initialization failed ({vllm_error}). "
-                    "Ensure vLLM and vllm-mlx are compatible or install mlx-lm as a fallback."
-                ) from vllm_error
 
     def _sampling_params(self):
         try:
@@ -871,6 +1046,93 @@ class VLLMTranslatorBackend(TranslatorBackend):
         return results
 
 
+class MLXLMTranslatorBackend(VLLMTranslatorBackend):
+    """Translation backend backed directly by mlx_lm."""
+
+    name = "mlx_lm"
+    _lock = threading.Lock()
+    _engine_cache: Dict[str, Any] = {}
+
+    def _cache_key(self) -> str:
+        return "mlx_lm|" + super()._cache_key()
+
+    def _engine(self):
+        cache_key = self._cache_key()
+        with MLXLMTranslatorBackend._lock:
+            cached = MLXLMTranslatorBackend._engine_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            try:
+                engine = _MLXLMEngine(self.model_path)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"mlx_lm initialization failed ({exc})") from exc
+            MLXLMTranslatorBackend._engine_cache[cache_key] = engine
+            return engine
+
+    def _sampling_params(self):
+        return _SimpleSamplingParams(
+            temperature=self.temperature,
+            top_p=self.top_p,
+            max_tokens=self.max_tokens,
+            repetition_penalty=self.repetition_penalty,
+        )
+
+
+class ExternalTranslatorBackend(VLLMTranslatorBackend):
+    """Translation backend that shells out to a user-provided command."""
+
+    name = "external"
+
+    def __init__(self, glossary: Optional[Dict[str, Any]] = None, model_path: str | None = None) -> None:
+        super().__init__(glossary=glossary, model_path=model_path)
+        self.command = _default_translation_command()
+
+    def warmup(self) -> None:
+        if not self.command:
+            raise RuntimeError(
+                "External translator backend requested but MTRANSLATE_TRANSLATE_COMMAND is not set"
+            )
+
+    def _generate(self, prompt: str) -> str:
+        if not self.command:
+            raise RuntimeError(
+                "External translator backend requested but MTRANSLATE_TRANSLATE_COMMAND is not set"
+            )
+        payload = {
+            "prompt": prompt,
+            "model": self.model_path,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
+            "repetition_penalty": self.repetition_penalty,
+        }
+        cp = subprocess.run(
+            shlex.split(self.command),
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if cp.returncode != 0:
+            detail = (cp.stderr or cp.stdout).strip()
+            raise RuntimeError(detail or f"external translator command failed with exit code {cp.returncode}")
+
+        stdout = (cp.stdout or "").strip()
+        if not stdout:
+            return ""
+
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            return stdout
+
+        for key in ("text", "translation", "output", "result"):
+            value = parsed.get(key)
+            if isinstance(value, str):
+                return value
+        raise RuntimeError("external translator command returned JSON without text/translation/output/result")
+
+
 @dataclass
 class TranslationSelection:
     backend: str
@@ -878,13 +1140,21 @@ class TranslationSelection:
 
 
 def select_translation_backend(glossary: Optional[Dict[str, Any]] = None) -> TranslationSelection:
-    backend = os.getenv("MTRANSLATE_TRANSLATE_BACKEND", "vllm").strip().lower()
-    if backend not in {"", "vllm"}:
+    backend = _env_str(("MTRANSLATE_LLM_BACKEND", "MTRANSLATE_TRANSLATE_BACKEND"), "vllm").lower()
+    if backend in {"", "vllm"}:
+        selected: TranslatorBackend = VLLMTranslatorBackend(glossary=glossary)
+        resolved_backend = "vllm"
+    elif backend in {"mlx", "mlx_lm"}:
+        selected = MLXLMTranslatorBackend(glossary=glossary)
+        resolved_backend = "mlx_lm"
+    elif backend in {"external", "command"}:
+        selected = ExternalTranslatorBackend(glossary=glossary)
+        resolved_backend = "external"
+    else:
         raise ValueError(
             f"Unsupported translate backend: {backend}. "
-            "Only `vllm` is supported (Gemma 3)."
+            "Supported: vllm, mlx_lm, external"
         )
 
-    vllm_backend = VLLMTranslatorBackend(glossary=glossary)
-    vllm_backend.warmup()
-    return TranslationSelection(backend="vllm", backend_obj=vllm_backend)
+    selected.warmup()
+    return TranslationSelection(backend=resolved_backend, backend_obj=selected)

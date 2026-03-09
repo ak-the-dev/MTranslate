@@ -40,13 +40,19 @@ def _parse_exports(value: str) -> list[str]:
 
 
 def _default_translate_model_ref() -> str:
-    override = os.getenv("MTRANSLATE_VLLM_MODEL", "").strip()
+    override = (
+        os.getenv("MTRANSLATE_LLM_MODEL", "").strip()
+        or os.getenv("MTRANSLATE_TRANSLATOR_MODEL", "").strip()
+        or os.getenv("MTRANSLATE_VLLM_MODEL", "").strip()
+    )
     if override:
         return override
 
     root = models_dir()
     candidates = [
         root / "mlx_community_gemma_3_4b_it_qat_4bit",
+        root / "translate_model",
+        root / "llm",
         root / "translator_llm_mlx",
         root / "translator_llm_vllm",
     ]
@@ -54,6 +60,23 @@ def _default_translate_model_ref() -> str:
         if path.exists():
             return str(path)
     return DEFAULT_TRANSLATE_VLLM_REPO
+
+
+def _apply_run_overrides(args: argparse.Namespace) -> None:
+    overrides = {
+        "MTRANSLATE_TRANSLATE_BACKEND": args.translate_backend,
+        "MTRANSLATE_LLM_MODEL": args.translate_model,
+        "MTRANSLATE_TRANSLATE_COMMAND": args.translate_command,
+        "MTRANSLATE_INPAINT_BACKEND": args.inpaint_backend,
+        "MTRANSLATE_INFILL_BACKEND": args.infill_backend,
+        "MTRANSLATE_INPAINT_MODEL": args.inpaint_model,
+        "MTRANSLATE_INFILL_MODEL": args.inpaint_model,
+        "MTRANSLATE_INPAINT_COMMAND": args.inpaint_command,
+        "MTRANSLATE_INFILL_COMMAND": args.infill_command,
+    }
+    for key, value in overrides.items():
+        if value:
+            os.environ[key] = value
 
 
 def cmd_models_pull(args: argparse.Namespace) -> int:
@@ -100,6 +123,7 @@ def cmd_models_pull_inpaint(args: argparse.Namespace) -> int:
     path = pull_inpaint_model(repo_id=args.repo, dest=args.path)
     print(f"Downloaded inpaint model: {path}")
     print(f"Set: export MTRANSLATE_INPAINT_MODEL='{path}'")
+    print(f"Alias: export MTRANSLATE_INFILL_MODEL='{path}'")
     ok, msgs = _verify_inpaint_dir(path)
     for m in msgs:
         print(m)
@@ -205,7 +229,8 @@ def cmd_models_pull_translate(args: argparse.Namespace) -> int:
             return 1
         raise
     print(f"Downloaded translation model: {path}")
-    print(f"Set: export MTRANSLATE_VLLM_MODEL='{path}'")
+    print(f"Set: export MTRANSLATE_LLM_MODEL='{path}'")
+    print(f"Alias: export MTRANSLATE_VLLM_MODEL='{path}'")
     ok, msgs = _verify_translate_dir(path)
     for m in msgs:
         print(m)
@@ -381,9 +406,10 @@ def cmd_models_verify_vllm(args: argparse.Namespace) -> int:
             smoke_env = dict(os.environ)
             if plugin:
                 smoke_env["VLLM_PLUGINS"] = plugin
-            smoke_env["MTRANSLATE_VLLM_DTYPE"] = args.dtype
-            smoke_env["MTRANSLATE_VLLM_GPU_MEMORY_UTIL"] = str(args.gpu_memory_util)
-            smoke_env["MTRANSLATE_VLLM_MAX_MODEL_LEN"] = str(args.max_model_len)
+                smoke_env["MTRANSLATE_LLM_PLUGIN"] = plugin
+            smoke_env["MTRANSLATE_LLM_DTYPE"] = args.dtype
+            smoke_env["MTRANSLATE_LLM_GPU_MEMORY_UTIL"] = str(args.gpu_memory_util)
+            smoke_env["MTRANSLATE_LLM_MAX_MODEL_LEN"] = str(args.max_model_len)
             cp = subprocess.run(
                 [
                     sys.executable,
@@ -433,6 +459,7 @@ def cmd_models_verify_vllm(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    _apply_run_overrides(args)
     exports = _parse_exports(args.export)
     runner = PipelineRunner(
         input_path=args.input,
@@ -506,7 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_ocr.add_argument("--root", required=True, help="Root containing det/cls/rec")
     verify_ocr.set_defaults(func=cmd_models_verify_ocr)
 
-    verify_inpaint = models_sub.add_parser("verify-inpaint", help="Verify local diffusion inpaint model directory")
+    verify_inpaint = models_sub.add_parser("verify-inpaint", help="Verify local inpaint model directory")
     verify_inpaint.add_argument("--path", required=True, help="Path to local inpaint model directory")
     verify_inpaint.set_defaults(func=cmd_models_verify_inpaint)
 
@@ -518,7 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_qwen.add_argument("--path", required=True, help="Path to Qwen-VL repository")
     verify_qwen.set_defaults(func=cmd_models_verify_qwen)
 
-    verify_vllm = models_sub.add_parser("verify-vllm", help="Verify vLLM installation")
+    verify_vllm = models_sub.add_parser("verify-vllm", help="Verify vLLM-backed translation runtime")
     verify_vllm.add_argument(
         "--model",
         default=_default_translate_model_ref(),
@@ -545,6 +572,46 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--export", default="folder,pdf", help="Comma-separated: folder,pdf")
     run.add_argument("--max-workers", type=int, default=None)
     run.add_argument("--font-path", default=None)
+    run.add_argument(
+        "--translate-backend",
+        default=None,
+        help="Translation backend override: vllm, mlx_lm, external",
+    )
+    run.add_argument(
+        "--translate-model",
+        default=None,
+        help="Translation model path or repo id override",
+    )
+    run.add_argument(
+        "--translate-command",
+        default=None,
+        help="External translator command override (JSON in on stdin, text/JSON out on stdout)",
+    )
+    run.add_argument(
+        "--inpaint-backend",
+        default=None,
+        help="Inpaint backend override: diffusion, copy, external",
+    )
+    run.add_argument(
+        "--infill-backend",
+        default=None,
+        help="Alias for --inpaint-backend",
+    )
+    run.add_argument(
+        "--inpaint-model",
+        default=None,
+        help="Inpaint model path override",
+    )
+    run.add_argument(
+        "--inpaint-command",
+        default=None,
+        help="External inpaint command override (JSON in on stdin, writes dst output)",
+    )
+    run.add_argument(
+        "--infill-command",
+        default=None,
+        help="Alias for --inpaint-command",
+    )
     run.set_defaults(func=cmd_run)
 
     status = sub.add_parser("status", help="Job status")

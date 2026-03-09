@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
+import shlex
+import subprocess
+from dataclasses import dataclass
 from typing import Dict, List
 
 from .env import env_float, env_int
@@ -23,12 +26,28 @@ class InpaintBackend:
         raise NotImplementedError
 
 
+def _default_inpaint_model_path() -> str:
+    for name in ("MTRANSLATE_INFILL_MODEL", "MTRANSLATE_INPAINT_MODEL"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _default_inpaint_command() -> str:
+    for name in ("MTRANSLATE_INFILL_COMMAND", "MTRANSLATE_INPAINT_COMMAND"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 class DiffusionInpaintBackend(InpaintBackend):
     name = "diffusion"
     _pipe_cache: Dict[tuple[str, str, str, str], object] = {}
 
     def __init__(self, model_path: str | None = None) -> None:
-        self.model_path = model_path or os.getenv("MTRANSLATE_INPAINT_MODEL", "").strip()
+        self.model_path = model_path or _default_inpaint_model_path()
         self.prompt = os.getenv(
             "MTRANSLATE_INPAINT_PROMPT",
             "clean manga paper texture, no text, preserve original artwork and line art",
@@ -96,8 +115,8 @@ class DiffusionInpaintBackend(InpaintBackend):
             except Exception:
                 pass
 
-        # Pony SDXL checkpoints are often base SDXL (4-channel UNet). For text-region
-        # infill we run masked img2img and composite only masked pixels back.
+        # Base image-to-image checkpoints can still be used for masked region cleanup
+        # by generating over a seeded fill image and compositing only masked pixels back.
         return "img2img_masked"
 
     def _pipeline(self):
@@ -107,7 +126,7 @@ class DiffusionInpaintBackend(InpaintBackend):
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 "Diffusion inpaint requires `torch` and `diffusers`. "
-                "Install them in your environment before using MTRANSLATE_INPAINT_BACKEND=diffusion."
+                "Install them before using MTRANSLATE_INPAINT_BACKEND=diffusion."
             ) from exc
 
         model_dir = Path(self.model_path).expanduser()
@@ -208,6 +227,79 @@ class DiffusionInpaintBackend(InpaintBackend):
         out.save(dst)
 
 
+class CopyInpaintBackend(InpaintBackend):
+    name = "copy"
+
+    def warmup(self) -> None:
+        return None
+
+    def inpaint(self, src: Path, masks: List[InpaintMask], dst: Path) -> None:
+        copy_file(src, dst)
+
+
+class ExternalInpaintBackend(InpaintBackend):
+    name = "external"
+
+    def __init__(self, model_path: str | None = None) -> None:
+        self.model_path = model_path or _default_inpaint_model_path()
+        self.command = _default_inpaint_command()
+        self.prompt = os.getenv("MTRANSLATE_INPAINT_PROMPT", "").strip()
+        self.negative_prompt = os.getenv("MTRANSLATE_INPAINT_NEGATIVE_PROMPT", "").strip()
+        self.steps = env_int("MTRANSLATE_INPAINT_STEPS", 28, min_value=1, max_value=200)
+        self.guidance = env_float("MTRANSLATE_INPAINT_GUIDANCE", 6.0, min_value=0.0, max_value=20.0)
+        self.strength = env_float("MTRANSLATE_INPAINT_STRENGTH", 0.95, min_value=0.0, max_value=1.0)
+
+    def warmup(self) -> None:
+        if not self.command:
+            raise RuntimeError(
+                "External inpaint backend requested but MTRANSLATE_INPAINT_COMMAND is not set"
+            )
+
+    def inpaint(self, src: Path, masks: List[InpaintMask], dst: Path) -> None:
+        if not self.command:
+            raise RuntimeError(
+                "External inpaint backend requested but MTRANSLATE_INPAINT_COMMAND is not set"
+            )
+        payload = {
+            "src": str(src),
+            "dst": str(dst),
+            "model": self.model_path,
+            "masks": [asdict(mask) for mask in masks],
+            "prompt": self.prompt,
+            "negative_prompt": self.negative_prompt,
+            "steps": self.steps,
+            "guidance": self.guidance,
+            "strength": self.strength,
+        }
+        cp = subprocess.run(
+            shlex.split(self.command),
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if cp.returncode != 0:
+            detail = (cp.stderr or cp.stdout).strip()
+            raise RuntimeError(detail or f"external inpaint command failed with exit code {cp.returncode}")
+
+        if dst.exists():
+            return
+
+        stdout = (cp.stdout or "").strip()
+        if stdout:
+            try:
+                parsed = json.loads(stdout)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                output_path = parsed.get("output") or parsed.get("dst") or parsed.get("result")
+                if isinstance(output_path, str) and output_path.strip():
+                    copy_file(Path(output_path.strip()), dst)
+                    return
+
+        raise RuntimeError("external inpaint command completed without producing the requested output file")
+
+
 @dataclass
 class InpaintSelection:
     backend: str
@@ -215,14 +307,26 @@ class InpaintSelection:
 
 
 def select_inpaint_backend() -> InpaintSelection:
-    backend = os.getenv("MTRANSLATE_INPAINT_BACKEND", "diffusion").strip().lower()
+    backend = (
+        os.getenv("MTRANSLATE_INFILL_BACKEND")
+        or os.getenv("MTRANSLATE_INPAINT_BACKEND")
+        or "diffusion"
+    ).strip().lower()
 
-    if backend in {"diffusion", "sd", "stable_diffusion"}:
+    if backend in {"diffusion", "diffusers", "sd", "stable_diffusion"}:
         diff = DiffusionInpaintBackend()
         diff.warmup()
         return InpaintSelection(backend="diffusion", backend_obj=diff)
+    if backend in {"copy", "none", "noop"}:
+        copy_backend = CopyInpaintBackend()
+        copy_backend.warmup()
+        return InpaintSelection(backend="copy", backend_obj=copy_backend)
+    if backend in {"external", "command"}:
+        ext = ExternalInpaintBackend()
+        ext.warmup()
+        return InpaintSelection(backend="external", backend_obj=ext)
 
     raise ValueError(
         f"Unsupported inpaint backend: {backend}. "
-        "Only `diffusion` (SDXL inpaint) is supported."
+        "Supported: diffusion, copy, external"
     )
