@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
+from .env import env_float, env_int
 from .types import InpaintMask
 from .utils import copy_file
 
@@ -36,9 +37,9 @@ class DiffusionInpaintBackend(InpaintBackend):
             "MTRANSLATE_INPAINT_NEGATIVE_PROMPT",
             "letters, words, watermark, blurry, distorted anatomy, artifacts",
         )
-        self.steps = int(os.getenv("MTRANSLATE_INPAINT_STEPS", "28"))
-        self.guidance = float(os.getenv("MTRANSLATE_INPAINT_GUIDANCE", "6.0"))
-        self.strength = float(os.getenv("MTRANSLATE_INPAINT_STRENGTH", "0.95"))
+        self.steps = env_int("MTRANSLATE_INPAINT_STEPS", 28, min_value=4, max_value=200)
+        self.guidance = env_float("MTRANSLATE_INPAINT_GUIDANCE", 6.0, min_value=0.0, max_value=20.0)
+        self.strength = env_float("MTRANSLATE_INPAINT_STRENGTH", 0.95, min_value=0.0, max_value=1.0)
         self.device_pref = os.getenv("MTRANSLATE_INPAINT_DEVICE", "auto").strip().lower()
         self._pipeline_mode = "inpaint"
 
@@ -172,7 +173,10 @@ class DiffusionInpaintBackend(InpaintBackend):
         generator = None
         seed = os.getenv("MTRANSLATE_INPAINT_SEED", "").strip()
         if seed:
-            generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
+            try:
+                generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
+            except ValueError:
+                generator = None
 
         if self._pipeline_mode == "inpaint":
             out = pipe(

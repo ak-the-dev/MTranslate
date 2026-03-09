@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import re
-import shutil
 import threading
 import uuid
 from dataclasses import asdict
@@ -14,16 +12,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from .constants import APP_NAME, DEFAULT_EXPORT, STAGES
+from .constants import ALLOWED_EXPORT_FORMATS, APP_NAME, DEFAULT_EXPORT, STAGES
 from .dictionary_rules import apply_replacement_rules, load_replacement_rules
+from .env import env_bool, env_float, env_int
 from .glossary import load_glossary
+from .inpaint_backends import select_inpaint_backend
 from .jsonl_logger import EventLogger
 from .native import native_images_to_pdf, native_typeset_batch
 from .ocr_backends import extract_regions_batch
 from .paths import app_support_dir, ensure_job_tree, job_dir
-from .inpaint_backends import select_inpaint_backend
 from .translator_backends import select_translation_backend
-from .types import InpaintMask, JobManifest, PageManifest, StageState, TextRegion, TypesetBlock, job_from_dict
+from .types import InpaintMask, JobManifest, PageManifest, TextRegion, TypesetBlock, job_from_dict
 from .utils import (
     atomic_write_json,
     convert_to_png,
@@ -31,7 +30,6 @@ from .utils import (
     detect_mime,
     get_image_dimensions,
     list_images,
-    parse_page_ranges,
     read_json,
 )
 from .vlm_backends import get_vlm_backend
@@ -39,6 +37,35 @@ from .vlm_backends import get_vlm_backend
 
 class PipelineError(RuntimeError):
     pass
+
+
+def _validate_export_formats(export_formats: Sequence[str] | None) -> List[str]:
+    if not export_formats:
+        return list(DEFAULT_EXPORT)
+    normalized = [x.strip().lower() for x in export_formats if x and x.strip()]
+    if not normalized:
+        raise PipelineError("At least one export format is required")
+    unsupported = sorted({x for x in normalized if x not in ALLOWED_EXPORT_FORMATS})
+    if unsupported:
+        allowed = ",".join(sorted(ALLOWED_EXPORT_FORMATS))
+        raise PipelineError(f"Unsupported export format(s): {', '.join(unsupported)}. Allowed: {allowed}")
+    return normalized
+
+
+def _validate_io_paths(input_path: Path, output_path: Path) -> None:
+    if not input_path.exists():
+        raise PipelineError(f"Input path does not exist: {input_path}")
+    if not input_path.is_dir():
+        raise PipelineError(f"Input path must be a directory: {input_path}")
+    if output_path == input_path:
+        raise PipelineError("Output path must be different from input path")
+    try:
+        if output_path.is_relative_to(input_path):
+            raise PipelineError("Output path must not be inside input path")
+    except AttributeError:
+        # Python < 3.9 compatibility fallback.
+        if str(output_path).startswith(str(input_path) + os.sep):
+            raise PipelineError("Output path must not be inside input path")
 
 
 def _series_id_from_input(input_path: str) -> str:
@@ -67,10 +94,6 @@ def _bootstrap_series_glossary(path: Path) -> None:
     )
 
 
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _manifest_path(job_id: str) -> Path:
     return job_dir(job_id) / "manifest.json"
 
@@ -78,10 +101,6 @@ def _manifest_path(job_id: str) -> Path:
 def _default_font_path(repo_root: Path) -> Optional[str]:
     font = repo_root / "assets" / "fonts" / "manga.ttf"
     return str(font) if font.exists() else None
-
-
-def _stage_index(name: str) -> int:
-    return STAGES.index(name)
 
 
 def _looks_japanese(text: str) -> bool:
@@ -464,9 +483,13 @@ class PipelineRunner:
         job_id: str | None = None,
         repo_root: str | None = None,
     ) -> None:
-        self.input_path = str(Path(input_path).expanduser().resolve())
-        self.output_path = str(Path(output_path).expanduser().resolve())
-        self.export_formats = list(export_formats or DEFAULT_EXPORT)
+        input_dir = Path(input_path).expanduser().resolve()
+        output_dir = Path(output_path).expanduser().resolve()
+        _validate_io_paths(input_dir, output_dir)
+
+        self.input_path = str(input_dir)
+        self.output_path = str(output_dir)
+        self.export_formats = _validate_export_formats(export_formats)
         self.series_id = _series_id_from_input(self.input_path)
         if glossary_path:
             self.glossary_path = str(Path(glossary_path).expanduser().resolve())
@@ -487,9 +510,10 @@ class PipelineRunner:
         )
         self.pre_dict_rules = load_replacement_rules(self.pre_dict_path)
         self.post_dict_rules = load_replacement_rules(self.post_dict_path)
-        self.context_pages = max(0, int(os.getenv("MTRANSLATE_CONTEXT_PAGES", "2")))
-        self.context_history_lines = max(0, int(os.getenv("MTRANSLATE_CONTEXT_HISTORY_LINES", "24")))
-        self.max_workers = max_workers or max(2, min(8, (os.cpu_count() or 4)))
+        self.context_pages = env_int("MTRANSLATE_CONTEXT_PAGES", 2, min_value=0, max_value=8)
+        self.context_history_lines = env_int("MTRANSLATE_CONTEXT_HISTORY_LINES", 24, min_value=0, max_value=200)
+        default_workers = max(2, min(8, (os.cpu_count() or 4)))
+        self.max_workers = max(1, min(32, max_workers or default_workers))
         self.repo_root = Path(repo_root or os.getcwd())
         self.font_path = font_path or _default_font_path(self.repo_root)
         self._manifest_lock = threading.Lock()
@@ -525,6 +549,8 @@ class PipelineRunner:
             job_id=job_id,
             repo_root=repo_root,
         )
+        for page in manifest.pages.values():
+            page.ensure_stages(STAGES)
         runner.manifest = manifest
         runner.save_manifest()
         return runner
@@ -555,7 +581,7 @@ class PipelineRunner:
         manifest.notes["font_path"] = self.font_path
         manifest.notes["engine"] = {
             "name": APP_NAME,
-            "runtime": "python+macos-native-helpers",
+            "runtime": "python+ai-backends",
             "max_workers": self.max_workers,
             "created_by": "mtranslate run",
         }
@@ -626,7 +652,7 @@ class PipelineRunner:
         st.error_message = error_message
 
         if ok:
-            page.status = "done"
+            page.status = "done" if stage == STAGES[-1] else "running"
         else:
             page.status = "failed"
 
@@ -649,10 +675,9 @@ class PipelineRunner:
         page: PageManifest,
         stage: str,
         fn: Callable[[PageManifest], None],
-        force: bool = False,
     ) -> None:
         st = page.stages[stage]
-        if st.status == "done" and not force:
+        if st.status == "done":
             return
 
         started_ts = self._stage_begin(page, stage)
@@ -685,8 +710,8 @@ class PipelineRunner:
         page.mime_type = mime
         page.output_paths["normalized"] = str(normalized)
 
-    def _ocr_stage(self, pages: List[PageManifest], force: bool = False) -> None:
-        target_pages = [p for p in pages if force or p.stages["ocr"].status != "done"]
+    def _ocr_stage(self, pages: List[PageManifest]) -> None:
+        target_pages = [p for p in pages if p.stages["ocr"].status != "done"]
         if not target_pages:
             return
 
@@ -770,22 +795,29 @@ class PipelineRunner:
 
     def _semantic_group_page(self, page: PageManifest) -> None:
         ocr_backend = str(self.manifest.notes.get("ocr_backend", "")).strip().lower()
-        default_min_conf = "0.30" if ocr_backend == "vision" else "0.55"
-        min_conf = float(os.getenv("MTRANSLATE_REGION_MIN_CONFIDENCE", default_min_conf))
-        min_area = int(os.getenv("MTRANSLATE_REGION_MIN_AREA", "120"))
-        max_area_ratio = float(os.getenv("MTRANSLATE_REGION_MAX_AREA_RATIO", "0.22"))
-        default_max_aspect_ratio = "16.0" if ocr_backend == "vision" else "10.0"
-        max_aspect_ratio = float(os.getenv("MTRANSLATE_REGION_MAX_ASPECT_RATIO", default_max_aspect_ratio))
-        default_merge_enabled = "0" if ocr_backend == "vision" else "1"
-        merge_enabled = os.getenv("MTRANSLATE_REGION_MERGE", default_merge_enabled).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        default_top_toolbar_ratio = "0.015" if ocr_backend == "vision" else "0.04"
-        top_toolbar_ratio = float(os.getenv("MTRANSLATE_REGION_TOP_BANNER_RATIO", default_top_toolbar_ratio))
-        top_width_ratio = float(os.getenv("MTRANSLATE_REGION_TOP_BANNER_WIDTH_RATIO", "0.60"))
-        top_filter_max_conf = float(os.getenv("MTRANSLATE_REGION_TOP_BANNER_MAX_CONF", "0.90"))
+        min_conf = env_float(
+            "MTRANSLATE_REGION_MIN_CONFIDENCE",
+            0.30 if ocr_backend == "vision" else 0.55,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        min_area = env_int("MTRANSLATE_REGION_MIN_AREA", 120, min_value=1, max_value=200_000)
+        max_area_ratio = env_float("MTRANSLATE_REGION_MAX_AREA_RATIO", 0.22, min_value=0.01, max_value=0.95)
+        max_aspect_ratio = env_float(
+            "MTRANSLATE_REGION_MAX_ASPECT_RATIO",
+            16.0 if ocr_backend == "vision" else 10.0,
+            min_value=1.0,
+            max_value=80.0,
+        )
+        merge_enabled = env_bool("MTRANSLATE_REGION_MERGE", default=ocr_backend != "vision")
+        top_toolbar_ratio = env_float(
+            "MTRANSLATE_REGION_TOP_BANNER_RATIO",
+            0.015 if ocr_backend == "vision" else 0.04,
+            min_value=0.0,
+            max_value=0.2,
+        )
+        top_width_ratio = env_float("MTRANSLATE_REGION_TOP_BANNER_WIDTH_RATIO", 0.60, min_value=0.0, max_value=1.0)
+        top_filter_max_conf = env_float("MTRANSLATE_REGION_TOP_BANNER_MAX_CONF", 0.90, min_value=0.0, max_value=1.0)
         page_area = max(1, int((page.width or 1) * (page.height or 1)))
 
         filtered: List[TextRegion] = []
@@ -812,9 +844,9 @@ class PipelineRunner:
 
         merged = _merge_regions(filtered) if merge_enabled else list(filtered)
         merged = _dedupe_overlapping_regions(merged, iou_threshold=0.5)
-        if os.getenv("MTRANSLATE_SNAP_TEXT_BOXES", "0").strip().lower() in {"1", "true", "yes"}:
+        if env_bool("MTRANSLATE_SNAP_TEXT_BOXES", default=False):
             _snap_regions_to_beige_boxes(page, merged)
-        max_regions = int(os.getenv("MTRANSLATE_MAX_REGIONS_PER_PAGE", "10"))
+        max_regions = env_int("MTRANSLATE_MAX_REGIONS_PER_PAGE", 10, min_value=1, max_value=100)
         if len(merged) > max_regions:
             merged = sorted(merged, key=lambda r: (_bbox_area(r.bbox), r.confidence), reverse=True)[:max_regions]
         merged.sort(key=lambda r: (r.bbox[1], r.bbox[0]))
@@ -871,7 +903,7 @@ class PipelineRunner:
             return text, []
         return apply_replacement_rules(text, self.post_dict_rules)
 
-    def _translate_pages(self, pages: List[PageManifest], force: bool = False) -> None:
+    def _translate_pages(self, pages: List[PageManifest]) -> None:
         translate_selection = self._ensure_translation_selection()
         self.manifest.notes["translate_backend"] = translate_selection.backend
 
@@ -882,7 +914,7 @@ class PipelineRunner:
 
         for page in by_order:
             st = page.stages["translate"]
-            if st.status == "done" and not force:
+            if st.status == "done":
                 continue
             started_ts = self._stage_begin(page, "translate")
             try:
@@ -897,22 +929,12 @@ class PipelineRunner:
                 batch_sources: List[str] = []
                 batch_contexts: List[Dict[str, Any]] = []
                 batch_regions: List[TextRegion] = []
-                pre_dict_changes: List[Dict[str, Any]] = []
 
                 for region in page.text_regions:
                     source_text = (region.text or "").strip()
                     if not source_text:
                         continue
-                    source_text, pre_changes = self._apply_pre_dict(source_text)
-                    if pre_changes:
-                        pre_dict_changes.append(
-                            {
-                                "region_id": region.id,
-                                "before": region.text,
-                                "after": source_text,
-                                "rules": pre_changes,
-                            }
-                        )
+                    source_text, _ = self._apply_pre_dict(source_text)
                     if not source_text:
                         continue
                     context = {
@@ -939,22 +961,11 @@ class PipelineRunner:
                         f"sources={len(batch_regions)}, outputs={len(translations)}"
                     )
 
-                post_dict_changes: List[Dict[str, Any]] = []
                 for region, region_translation in zip(batch_regions, translations):
                     region_translation = (region_translation or "").strip()
                     if not region_translation.strip():
                         continue
-                    original_translation = region_translation
-                    region_translation, post_changes = self._apply_post_dict(region_translation)
-                    if post_changes:
-                        post_dict_changes.append(
-                            {
-                                "region_id": region.id,
-                                "before": original_translation,
-                                "after": region_translation,
-                                "rules": post_changes,
-                            }
-                        )
+                    region_translation, _ = self._apply_post_dict(region_translation)
                     if not region_translation:
                         continue
                     region.source = "translated"
@@ -980,35 +991,18 @@ class PipelineRunner:
                 self._translated_page_cache[page.page_id] = [
                     b.text.strip() for b in page.typeset_blocks if (b.text or "").strip()
                 ]
-
                 backend_debug = backend.drain_debug_events()
-                if backend_debug or pre_dict_changes or post_dict_changes:
+                if backend_debug:
                     debug_file = self.paths["logs"] / f"translate_{page.page_id}.json"
                     atomic_write_json(
                         debug_file,
                         {
                             "page_id": page.page_id,
                             "history_context": history_lines,
-                            "pre_dict_changes": pre_dict_changes,
-                            "post_dict_changes": post_dict_changes,
                             "events": backend_debug,
                         },
                     )
                     page.output_paths["translate_debug"] = str(debug_file)
-
-                review_file = self.paths["review"] / f"{page.page_id}.json"
-                atomic_write_json(
-                    review_file,
-                    {
-                        "page_id": page.page_id,
-                        "input_path": page.input_path,
-                        "normalized_path": page.normalized_path,
-                        "blocks": [asdict(b) for b in page.typeset_blocks],
-                        "regions": [asdict(r) for r in page.text_regions],
-                        "history_context": history_lines,
-                    },
-                )
-                page.output_paths["review"] = str(review_file)
                 self._stage_end(page, "translate", True, started_ts)
             except Exception as exc:  # noqa: BLE001
                 self._stage_end(
@@ -1023,10 +1017,10 @@ class PipelineRunner:
     def _mask_page(self, page: PageManifest) -> None:
         masks: List[InpaintMask] = []
         use_blocks = os.getenv("MTRANSLATE_MASK_SOURCE", "regions").strip().lower() == "blocks"
-        dilation_ratio = max(0.0, float(os.getenv("MTRANSLATE_MASK_DILATION_RATIO", "0.10")))
-        dilation_offset = int(os.getenv("MTRANSLATE_MASK_DILATION_OFFSET", "0"))
-        dilation_min = max(0, int(os.getenv("MTRANSLATE_MASK_DILATION_MIN", "4")))
-        dilation_max = max(dilation_min, int(os.getenv("MTRANSLATE_MASK_DILATION_MAX", "120")))
+        dilation_ratio = env_float("MTRANSLATE_MASK_DILATION_RATIO", 0.10, min_value=0.0, max_value=1.5)
+        dilation_offset = env_int("MTRANSLATE_MASK_DILATION_OFFSET", 0, min_value=-200, max_value=200)
+        dilation_min = env_int("MTRANSLATE_MASK_DILATION_MIN", 4, min_value=0, max_value=512)
+        dilation_max = env_int("MTRANSLATE_MASK_DILATION_MAX", 120, min_value=dilation_min, max_value=2048)
         if use_blocks and page.typeset_blocks:
             sources = [(b.region_id, b.bbox, 0.95) for b in page.typeset_blocks]
         else:
@@ -1059,8 +1053,8 @@ class PipelineRunner:
         self.inpaint_selection.backend_obj.inpaint(src=src, masks=page.masks, dst=dst)
         page.output_paths["inpaint"] = str(dst)
 
-    def _typeset_pages(self, pages: List[PageManifest], force: bool = False) -> None:
-        todo = [p for p in pages if force or p.stages["typeset"].status != "done"]
+    def _typeset_pages(self, pages: List[PageManifest]) -> None:
+        todo = [p for p in pages if p.stages["typeset"].status != "done"]
         if not todo:
             return
 
@@ -1132,46 +1126,33 @@ class PipelineRunner:
             except Exception as exc:  # noqa: BLE001
                 self.manifest.notes["pdf_error"] = str(exc)
 
-    def run(
-        self,
-        selected_pages: Optional[set[str]] = None,
-        start_stage: Optional[str] = None,
-        end_stage: Optional[str] = None,
-        force: bool = False,
-    ) -> JobManifest:
+    def run(self) -> JobManifest:
         self._set_job_status("running")
         pages = [self.manifest.pages[k] for k in sorted(self.manifest.pages)]
-
-        if selected_pages:
-            pages = [p for p in pages if p.page_id in selected_pages]
 
         if not pages:
             raise PipelineError("No pages selected for execution")
 
-        start_at = _stage_index(start_stage) if start_stage else 0
-        end_at = _stage_index(end_stage) if end_stage else (len(STAGES) - 1)
-        if end_at < start_at:
-            raise PipelineError(f"Invalid stage range: start={start_stage} end={end_stage}")
-
         stage_funcs = {
-            "ingest": lambda p: self._run_stage_for_page(p, "ingest", self._ingest_page, force=force),
-            "ocr": lambda p: self._ocr_stage([p], force=force),
-            "vlm_refine": lambda p: self._run_stage_for_page(p, "vlm_refine", self._vlm_refine_page, force=force),
-            "semantic_group": lambda p: self._run_stage_for_page(p, "semantic_group", self._semantic_group_page, force=force),
-            "translate": lambda p: self._translate_pages([p], force=force),
-            "mask": lambda p: self._run_stage_for_page(p, "mask", self._mask_page, force=force),
-            "inpaint": lambda p: self._run_stage_for_page(p, "inpaint", self._inpaint_page, force=force),
-            "typeset": lambda p: self._typeset_pages([p], force=force),
-            "compose": lambda p: self._run_stage_for_page(p, "compose", self._compose_page, force=force),
-            "export": lambda p: self._run_stage_for_page(p, "export", self._export_page, force=force),
+            "ingest": lambda p: self._run_stage_for_page(p, "ingest", self._ingest_page),
+            "ocr": lambda p: self._ocr_stage([p]),
+            "vlm_refine": lambda p: self._run_stage_for_page(p, "vlm_refine", self._vlm_refine_page),
+            "semantic_group": lambda p: self._run_stage_for_page(p, "semantic_group", self._semantic_group_page),
+            "translate": lambda p: self._translate_pages([p]),
+            "mask": lambda p: self._run_stage_for_page(p, "mask", self._mask_page),
+            "inpaint": lambda p: self._run_stage_for_page(p, "inpaint", self._inpaint_page),
+            "typeset": lambda p: self._typeset_pages([p]),
+            "compose": lambda p: self._run_stage_for_page(p, "compose", self._compose_page),
+            "export": lambda p: self._run_stage_for_page(p, "export", self._export_page),
         }
 
         for page in sorted(pages, key=lambda p: p.index):
-            for stage in STAGES[start_at : (end_at + 1)]:
+            for stage in STAGES:
                 stage_funcs[stage](page)
+                if page.stages[stage].status == "failed":
+                    break
 
-        if start_at <= _stage_index("export") <= end_at:
-            self._finalize_pdf(list(self.manifest.pages.values()))
+        self._finalize_pdf(list(self.manifest.pages.values()))
 
         failed = [
             p
@@ -1186,165 +1167,105 @@ class PipelineRunner:
 
         return self.manifest
 
-    def apply_review_edits(self, edits_file: str) -> JobManifest:
-        payload = read_json(Path(edits_file))
-        pages_payload = payload.get("pages", {})
-        if not isinstance(pages_payload, dict):
-            raise PipelineError("Review edits file must contain {\"pages\": {...}}")
-
-        pages_from_mask: set[str] = set()
-        pages_from_typeset: set[str] = set()
-        for page_id, edits in pages_payload.items():
-            page = self.manifest.pages.get(page_id)
-            if not page:
-                continue
-
-            page_block_edits: list[dict[str, Any]] = []
-            page_region_edits: list[dict[str, Any]] = []
-            if isinstance(edits, list):
-                page_block_edits = [e for e in edits if isinstance(e, dict)]
-            elif isinstance(edits, dict):
-                page_block_edits = [e for e in edits.get("blocks", []) if isinstance(e, dict)]
-                page_region_edits = [e for e in edits.get("regions", []) if isinstance(e, dict)]
-            else:
-                continue
-
-            block_by_id = {b.region_id: b for b in page.typeset_blocks}
-            region_by_id = {r.id: r for r in page.text_regions}
-
-            region_changed = False
-            block_changed = False
-
-            for edit in page_region_edits:
-                region_id = str(edit.get("region_id", ""))
-                region = region_by_id.get(region_id)
-                if not region:
-                    continue
-
-                enabled = edit.get("enabled")
-                if enabled is False:
-                    page.text_regions = [r for r in page.text_regions if r.id != region_id]
-                    page.typeset_blocks = [b for b in page.typeset_blocks if b.region_id != region_id]
-                    region_by_id.pop(region_id, None)
-                    block_by_id.pop(region_id, None)
-                    region_changed = True
-                    continue
-
-                bbox = edit.get("bbox")
-                if isinstance(bbox, list) and len(bbox) == 4:
-                    x = max(0, int(bbox[0]))
-                    y = max(0, int(bbox[1]))
-                    w = max(1, int(bbox[2]))
-                    h = max(1, int(bbox[3]))
-                    region.bbox = (x, y, w, h)
-                    region.polygon = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-                    region_changed = True
-
-            for edit in page_block_edits:
-                region_id = str(edit.get("region_id", ""))
-                block = block_by_id.get(region_id)
-                if not block:
-                    continue
-
-                enabled = edit.get("enabled")
-                if enabled is False:
-                    page.typeset_blocks = [b for b in page.typeset_blocks if b.region_id != region_id]
-                    block_by_id.pop(region_id, None)
-                    block_changed = True
-                    continue
-
-                if "text" in edit:
-                    block.text = str(edit.get("text", ""))
-                    block_changed = True
-
-                bbox = edit.get("bbox")
-                if isinstance(bbox, list) and len(bbox) == 4:
-                    x = max(0, int(bbox[0]))
-                    y = max(0, int(bbox[1]))
-                    w = max(1, int(bbox[2]))
-                    h = max(1, int(bbox[3]))
-                    block.bbox = (x, y, w, h)
-                    block_changed = True
-
-                if "font_size" in edit:
-                    block.font_size = max(6, int(edit["font_size"]))
-                    block_changed = True
-
-            if not (region_changed or block_changed):
-                continue
-
-            review_file = self.paths["review"] / f"{page.page_id}.json"
-            atomic_write_json(
-                review_file,
-                {
-                    "page_id": page.page_id,
-                    "blocks": [asdict(b) for b in page.typeset_blocks],
-                    "regions": [asdict(r) for r in page.text_regions],
-                },
-            )
-            page.output_paths["review"] = str(review_file)
-
-            if region_changed:
-                for st_name in ["mask", "inpaint", "typeset", "compose", "export"]:
-                    page.stages[st_name].status = "pending"
-                    page.stages[st_name].error_code = None
-                    page.stages[st_name].error_message = None
-                pages_from_mask.add(page.page_id)
-                pages_from_typeset.discard(page.page_id)
-            else:
-                for st_name in ["typeset", "compose", "export"]:
-                    page.stages[st_name].status = "pending"
-                    page.stages[st_name].error_code = None
-                    page.stages[st_name].error_message = None
-                if page.page_id not in pages_from_mask:
-                    pages_from_typeset.add(page.page_id)
-
-        if pages_from_mask:
-            self.run(selected_pages=pages_from_mask, start_stage="mask", force=True)
-        if pages_from_typeset:
-            self.run(selected_pages=pages_from_typeset, start_stage="typeset", force=True)
-
-        self.save_manifest()
-        return self.manifest
-
-
 def load_manifest(job_id: str) -> JobManifest:
     path = _manifest_path(job_id)
     if not path.exists():
         raise FileNotFoundError(f"Unknown job id: {job_id}")
     return job_from_dict(read_json(path))
 
+def audit_job(job_id: str) -> Dict[str, Any]:
+    manifest = load_manifest(job_id)
+    expected_outputs = {
+        "ingest": "normalized",
+        "ocr": "ocr",
+        "mask": "masks",
+        "inpaint": "inpaint",
+        "typeset": "typeset",
+        "compose": "compose",
+    }
+    findings: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    pages = sorted(manifest.pages.values(), key=lambda p: p.index)
 
-def retry_job(job_id: str, pages_spec: str, stage: str, repo_root: str | None = None) -> JobManifest:
-    if stage not in STAGES:
-        raise ValueError(f"Unknown stage: {stage}")
+    for page in pages:
+        page_findings: List[str] = []
+        page_warnings: List[str] = []
+        failed_seen = False
+        for stage in STAGES:
+            state = page.stages.get(stage)
+            if state is None:
+                page_findings.append(f"missing stage state: {stage}")
+                continue
+            if state.status not in {"pending", "running", "done", "failed", "skipped"}:
+                page_findings.append(f"invalid stage status '{state.status}' for {stage}")
+            if failed_seen and state.status == "done":
+                page_findings.append(f"stage {stage} completed after an earlier stage failed")
+            output_key = expected_outputs.get(stage)
+            if state.status == "done" and output_key:
+                out = page.output_paths.get(output_key)
+                if not out:
+                    page_findings.append(f"missing output path '{output_key}' after stage {stage}")
+                elif not Path(out).exists():
+                    page_findings.append(f"output file missing on disk for '{output_key}': {out}")
+            if state.status == "failed" and not state.error_message:
+                page_warnings.append(f"missing error message for failed stage {stage}")
+            if state.status == "failed":
+                failed_seen = True
 
-    runner = PipelineRunner.from_job(job_id=job_id, repo_root=repo_root)
-    manifest = runner.manifest
-    selected = parse_page_ranges(pages_spec, manifest.pages.keys())
-    if not selected:
-        raise ValueError("No pages matched retry range")
+        if "folder" in manifest.export and page.stages.get("export") and page.stages["export"].status == "done":
+            final_page = page.output_paths.get("final_page")
+            if not final_page:
+                page_findings.append("export stage done but final_page output is missing")
+            elif not Path(final_page).exists():
+                page_findings.append(f"exported page missing on disk: {final_page}")
 
-    start_idx = _stage_index(stage)
-    for page_id in selected:
-        page = manifest.pages[page_id]
-        for st_name in STAGES[start_idx:]:
-            st = page.stages[st_name]
-            st.status = "pending"
-            st.error_code = None
-            st.error_message = None
+        if page_findings:
+            findings.append({"page_id": page.page_id, "issues": page_findings})
+        if page_warnings:
+            warnings.append({"page_id": page.page_id, "issues": page_warnings})
 
-    runner.save_manifest()
-    return runner.run(selected_pages=selected, start_stage=stage, force=True)
+    if "pdf" in manifest.export:
+        pdf_out = str(manifest.notes.get("pdf_output", "")).strip()
+        if manifest.status == "done":
+            if not pdf_out:
+                findings.append({"job": "pdf", "issues": ["missing pdf_output in manifest notes"]})
+            elif not Path(pdf_out).exists():
+                findings.append({"job": "pdf", "issues": [f"missing PDF file on disk: {pdf_out}"]})
+
+    return {
+        "job_id": manifest.job_id,
+        "status": manifest.status,
+        "checks": {
+            "pages_checked": len(pages),
+            "findings": len(findings),
+            "warnings": len(warnings),
+            "ok": len(findings) == 0,
+        },
+        "findings": findings,
+        "warnings": warnings,
+    }
 
 
 def summarize_manifest(manifest: JobManifest) -> Dict[str, Any]:
     pages = list(manifest.pages.values())
     total = len(pages)
-    done = sum(1 for p in pages if p.stages["export"].status == "done")
-    failed = sum(1 for p in pages if any(st.status == "failed" for st in p.stages.values()))
-    running = sum(1 for p in pages if any(st.status == "running" for st in p.stages.values()))
-    pending = total - done - failed - running
+    done = 0
+    failed = 0
+    running = 0
+    pending = 0
+
+    for page in pages:
+        has_failed = any(st.status == "failed" for st in page.stages.values())
+        has_running = any(st.status == "running" for st in page.stages.values())
+        export_done = page.stages["export"].status == "done"
+        if has_failed:
+            failed += 1
+        elif export_done:
+            done += 1
+        elif has_running:
+            running += 1
+        else:
+            pending += 1
 
     return {
         "job_id": manifest.job_id,

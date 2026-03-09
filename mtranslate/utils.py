@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
 import uuid
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence
+from typing import Any, List, Sequence
 
 
 def run_cmd(cmd: Sequence[str], cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -31,27 +29,22 @@ def detect_mime(path: Path) -> str:
 
 
 def get_image_dimensions(path: Path) -> tuple[int, int]:
-    cp = run_cmd(["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)])
-    if cp.returncode != 0:
-        raise RuntimeError(f"Failed to read dimensions for {path}: {cp.stderr.strip()}")
-    width = None
-    height = None
-    for line in cp.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("pixelWidth:"):
-            width = int(line.split(":", 1)[1].strip())
-        elif line.startswith("pixelHeight:"):
-            height = int(line.split(":", 1)[1].strip())
-    if width is None or height is None:
-        raise RuntimeError(f"Could not parse dimensions for {path}")
-    return width, height
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("Pillow is required for image dimension detection")
+    with Image.open(path) as img:
+        return img.size
 
 
 def convert_to_png(src: Path, dst: Path) -> None:
+    try:
+        from PIL import Image
+    except ImportError:
+        raise RuntimeError("Pillow is required for image conversion")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    cp = run_cmd(["sips", "-s", "format", "png", str(src), "--out", str(dst)])
-    if cp.returncode != 0:
-        raise RuntimeError(f"Failed to normalize {src}: {cp.stderr.strip()}")
+    with Image.open(src) as img:
+        img.save(dst, "PNG")
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -84,42 +77,6 @@ def list_images(path: Path) -> list[Path]:
     return images
 
 
-def parse_page_ranges(spec: str, page_ids: Iterable[str]) -> set[str]:
-    ids = sorted(page_ids)
-    idx = {str(i + 1): pid for i, pid in enumerate(ids)}
-    selected: set[str] = set()
-    for part in [x.strip() for x in spec.split(",") if x.strip()]:
-        if "-" in part:
-            start_s, end_s = part.split("-", 1)
-            start = int(start_s)
-            end = int(end_s)
-            if start > end:
-                start, end = end, start
-            for i in range(start, end + 1):
-                pid = idx.get(str(i))
-                if pid:
-                    selected.add(pid)
-        else:
-            pid = idx.get(part)
-            if pid:
-                selected.add(pid)
-    return selected
-
-
 def copy_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-
-
-def to_dict(obj: Any) -> Any:
-    if hasattr(obj, "__dataclass_fields__"):
-        return asdict(obj)
-    if isinstance(obj, list):
-        return [to_dict(v) for v in obj]
-    if isinstance(obj, dict):
-        return {k: to_dict(v) for k, v in obj.items()}
-    return obj
-
-
-def env_truthy(key: str) -> bool:
-    return os.getenv(key, "").strip().lower() in {"1", "true", "yes", "on"}

@@ -14,43 +14,35 @@ from .utils import atomic_write_json, read_json
 MODEL_PROFILES = {
     "hq": [
         {
-            "id": "ocr_vision_macos",
+            "id": "ocr_paddle",
             "kind": "ocr",
-            "runtime": "vision",
-            "size_gb": 0.0,
-            "state": "ready",
-            "notes": "Uses native Vision framework",
-        },
-        {
-            "id": "vlm_refiner_mlx",
-            "kind": "vlm",
-            "runtime": "mlx",
-            "size_gb": 16.0,
+            "runtime": "paddle",
+            "size_gb": 1.2,
             "state": "missing",
-            "notes": "Place local model artifacts in models/vlm_refiner_mlx",
+            "notes": "Standard PaddleOCR weights",
         },
         {
-            "id": "translator_llm_vllm",
+            "id": "mlx_community_gemma_3_4b_it_qat_4bit",
             "kind": "llm",
-            "runtime": "vllm",
-            "size_gb": 10.0,
-            "state": "missing",
-            "notes": "Place Gemma 3 weights in models/google_gemma_3_4b_it",
+            "runtime": "vllm-mlx",
+            "size_gb": 3.0,
+            "state": "ready",
+            "notes": "Quantized Gemma 3",
         },
         {
-            "id": "inpaint_sdxl",
+            "id": "sdxl_inpaint",
             "kind": "inpaint",
             "runtime": "diffusers",
-            "size_gb": 18.0,
-            "state": "missing",
-            "notes": "Place SDXL inpaint artifacts in models/sdxl_inpaint",
+            "size_gb": 12.0,
+            "state": "ready",
+            "notes": "Pony Diffusion V6 XL",
         },
     ]
 }
 
 DEFAULT_INPAINT_REPO = "Runware/Pony_Diffusion_V6_XL"
-DEFAULT_TRANSLATE_REPO = "google/gemma-3-4b-it"
-DEFAULT_TRANSLATE_VLLM_REPO = "google/gemma-3-4b-it"
+DEFAULT_TRANSLATE_REPO = "mlx-community/gemma-3-4b-it-qat-4bit"
+DEFAULT_TRANSLATE_VLLM_REPO = "mlx-community/gemma-3-4b-it-qat-4bit"
 
 
 @dataclass

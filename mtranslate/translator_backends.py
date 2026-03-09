@@ -8,6 +8,9 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .env import env_bool, env_float, env_int
+from .paths import models_dir
+
 
 class TranslatorBackend:
     name = "base"
@@ -28,6 +31,25 @@ class TranslatorBackend:
 
 
 BatchItem = Tuple[int, str, Dict[str, Any]]
+
+
+def _default_translation_model_path() -> str:
+    for env_name in ("MTRANSLATE_VLLM_MODEL", "MTRANSLATE_TRANSLATOR_MODEL"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+
+    root = models_dir()
+    candidates = [
+        root / "mlx_community_gemma_3_4b_it_qat_4bit",
+        root / "translator_llm_mlx",
+        root / "translator_llm_vllm",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+
+    return "mlx-community/gemma-3-4b-it-qat-4bit"
 
 
 class VLLMTranslatorBackend(TranslatorBackend):
@@ -62,79 +84,64 @@ class VLLMTranslatorBackend(TranslatorBackend):
 
     def __init__(self, glossary: Optional[Dict[str, Any]] = None, model_path: str | None = None) -> None:
         self.glossary = glossary or {}
-        self.model_path = (
-            model_path
-            or os.getenv("MTRANSLATE_VLLM_MODEL", "").strip()
-            or os.getenv("MTRANSLATE_TRANSLATOR_MODEL", "").strip()
-            or "google/gemma-3-4b-it"
-        )
+        self.model_path = model_path or _default_translation_model_path()
         self.vllm_plugin = os.getenv("MTRANSLATE_VLLM_PLUGIN", "").strip()
         if self.vllm_plugin:
             os.environ.setdefault("VLLM_PLUGINS", self.vllm_plugin)
+        
+        # Workarounds for vLLM-MLX compatibility issues in certain versions
+        os.environ.setdefault("VLLM_USE_MODELSCOPE", "False")
+        # Force V0 engine as V1 often segfaults with the current MLX plugin
+        os.environ.setdefault("VLLM_V1", "0")
+
         plugin_name = (self.vllm_plugin or os.getenv("VLLM_PLUGINS", "")).strip().lower()
 
-        self.temperature = float(os.getenv("MTRANSLATE_VLLM_TEMPERATURE", "0.0"))
-        self.top_p = float(os.getenv("MTRANSLATE_VLLM_TOP_P", "0.95"))
-        self.max_tokens = int(os.getenv("MTRANSLATE_VLLM_MAX_TOKENS", "220"))
-        self.repetition_penalty = float(os.getenv("MTRANSLATE_VLLM_REPETITION_PENALTY", "1.02"))
-        self.tensor_parallel_size = int(os.getenv("MTRANSLATE_VLLM_TP", "1"))
+        self.temperature = env_float("MTRANSLATE_VLLM_TEMPERATURE", 0.0, min_value=0.0, max_value=2.0)
+        self.top_p = env_float("MTRANSLATE_VLLM_TOP_P", 0.95, min_value=0.0, max_value=1.0)
+        self.max_tokens = env_int("MTRANSLATE_VLLM_MAX_TOKENS", 220, min_value=8, max_value=4096)
+        self.repetition_penalty = env_float("MTRANSLATE_VLLM_REPETITION_PENALTY", 1.02, min_value=0.8, max_value=2.0)
+        self.tensor_parallel_size = env_int("MTRANSLATE_VLLM_TP", 1, min_value=1, max_value=16)
         self.dtype = os.getenv("MTRANSLATE_VLLM_DTYPE", "auto").strip() or "auto"
-        self.max_model_len = int(os.getenv("MTRANSLATE_VLLM_MAX_MODEL_LEN", "0"))
-        self.gpu_memory_utilization = float(os.getenv("MTRANSLATE_VLLM_GPU_MEMORY_UTIL", "0.85"))
+        self.max_model_len = env_int("MTRANSLATE_VLLM_MAX_MODEL_LEN", 0, min_value=0, max_value=131_072)
+        self.gpu_memory_utilization = env_float(
+            "MTRANSLATE_VLLM_GPU_MEMORY_UTIL",
+            0.85,
+            min_value=0.1,
+            max_value=0.99,
+        )
 
-        self.context_lines = max(0, int(os.getenv("MTRANSLATE_VLLM_CONTEXT_LINES", "2")))
-        self.context_chars = max(64, int(os.getenv("MTRANSLATE_VLLM_CONTEXT_CHARS", "260")))
-        self.context_line_chars = max(24, int(os.getenv("MTRANSLATE_VLLM_CONTEXT_LINE_CHARS", "88")))
-        self.min_source_chars_for_context = max(
-            0, int(os.getenv("MTRANSLATE_VLLM_MIN_SOURCE_CHARS_FOR_CONTEXT", "6"))
+        self.context_lines = env_int("MTRANSLATE_VLLM_CONTEXT_LINES", 2, min_value=0, max_value=24)
+        self.context_chars = env_int("MTRANSLATE_VLLM_CONTEXT_CHARS", 260, min_value=64, max_value=2000)
+        self.context_line_chars = env_int("MTRANSLATE_VLLM_CONTEXT_LINE_CHARS", 88, min_value=24, max_value=512)
+        self.min_source_chars_for_context = env_int(
+            "MTRANSLATE_VLLM_MIN_SOURCE_CHARS_FOR_CONTEXT",
+            6,
+            min_value=0,
+            max_value=200,
         )
 
         default_batch_enabled = "0" if "vllm_mlx" in plugin_name or "mlx" in plugin_name else "1"
-        self.batch_enabled = os.getenv("MTRANSLATE_VLLM_BATCH_ENABLED", default_batch_enabled).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        self.batch_size = max(1, int(os.getenv("MTRANSLATE_VLLM_BATCH_SIZE", "6")))
-        self.batch_retries = max(0, int(os.getenv("MTRANSLATE_VLLM_BATCH_RETRIES", "2")))
-        self.batch_split_depth = max(0, int(os.getenv("MTRANSLATE_VLLM_BATCH_SPLIT_DEPTH", "3")))
-        self.region_retries = max(0, int(os.getenv("MTRANSLATE_VLLM_REGION_RETRIES", "1")))
+        self.batch_enabled = env_bool("MTRANSLATE_VLLM_BATCH_ENABLED", default=(default_batch_enabled == "1"))
+        self.batch_size = env_int("MTRANSLATE_VLLM_BATCH_SIZE", 6, min_value=1, max_value=64)
+        self.batch_retries = env_int("MTRANSLATE_VLLM_BATCH_RETRIES", 2, min_value=0, max_value=10)
+        self.batch_split_depth = env_int("MTRANSLATE_VLLM_BATCH_SPLIT_DEPTH", 3, min_value=0, max_value=8)
+        self.region_retries = env_int("MTRANSLATE_VLLM_REGION_RETRIES", 1, min_value=0, max_value=5)
 
-        self.max_glossary_terms = max(1, int(os.getenv("MTRANSLATE_VLLM_GLOSSARY_MAX_TERMS", "12")))
-        self.glossary_fuzzy_max_distance = max(0, int(os.getenv("MTRANSLATE_VLLM_GLOSSARY_FUZZY_DIST", "2")))
+        self.max_glossary_terms = env_int("MTRANSLATE_VLLM_GLOSSARY_MAX_TERMS", 12, min_value=1, max_value=64)
+        self.glossary_fuzzy_max_distance = env_int("MTRANSLATE_VLLM_GLOSSARY_FUZZY_DIST", 2, min_value=0, max_value=5)
 
-        self.enable_reasoning = os.getenv("MTRANSLATE_VLLM_ENABLE_REASONING", "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        self.enable_reasoning = env_bool("MTRANSLATE_VLLM_ENABLE_REASONING", default=True)
         self.reasoning_model_hint = os.getenv("MTRANSLATE_VLLM_REASONING_MODEL_HINT", "gemma").strip().lower()
-        self.enforce_eager = os.getenv("MTRANSLATE_VLLM_ENFORCE_EAGER", "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        self.trust_remote_code = os.getenv("MTRANSLATE_VLLM_TRUST_REMOTE_CODE", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        self.enforce_eager = env_bool("MTRANSLATE_VLLM_ENFORCE_EAGER", default=True)
+        self.trust_remote_code = env_bool("MTRANSLATE_VLLM_TRUST_REMOTE_CODE", default=False)
 
-        self.hallucination_guard = os.getenv("MTRANSLATE_VLLM_HALLUCINATION_GUARD", "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        self.hallucination_guard = env_bool("MTRANSLATE_VLLM_HALLUCINATION_GUARD", default=True)
         symbols = os.getenv("MTRANSLATE_VLLM_SUSPICIOUS_SYMBOLS", "ହ,ി,ഹ")
         self.suspicious_symbols = [x.strip() for x in symbols.split(",") if x.strip()]
-        self.max_char_expansion = max(2.0, float(os.getenv("MTRANSLATE_VLLM_MAX_CHAR_EXPANSION", "8.0")))
+        self.max_char_expansion = env_float("MTRANSLATE_VLLM_MAX_CHAR_EXPANSION", 8.0, min_value=2.0, max_value=40.0)
 
-        self.debug_translation = os.getenv("MTRANSLATE_DEBUG_TRANSLATION", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        self.debug_preview_chars = max(120, int(os.getenv("MTRANSLATE_DEBUG_TRANSLATION_CHARS", "320")))
+        self.debug_translation = env_bool("MTRANSLATE_DEBUG_TRANSLATION", default=False)
+        self.debug_preview_chars = env_int("MTRANSLATE_DEBUG_TRANSLATION_CHARS", 320, min_value=120, max_value=4000)
         self._debug_events: List[Dict[str, Any]] = []
         self._debug_lock = threading.Lock()
 
@@ -165,26 +172,143 @@ class VLLMTranslatorBackend(TranslatorBackend):
 
             try:
                 from vllm import LLM  # type: ignore
+
+                # Monkey-patch vLLM-MLX platform compatibility issues
+                try:
+                    import vllm_mlx.platform as mlx_platform
+                    cls = mlx_platform.MLXPlatform
+
+                    # Some vLLM versions expect a device_type that torch.device() understands.
+                    # MLX is out-of-tree, so we map it to 'cpu' or 'mps' for the config check.
+                    cls.device_type = "cpu" 
+
+                    if not hasattr(cls, "get_compile_backend"):
+                        cls.get_compile_backend = classmethod(lambda c: None)
+                    if not hasattr(cls, "pre_register_and_update"):
+                        cls.pre_register_and_update = classmethod(lambda c, parser=None: None)
+                    if not hasattr(cls, "check_and_update_config"):
+                        cls.check_and_update_config = classmethod(lambda c, vllm_config: None)
+                    if not hasattr(cls, "verify_model_arch"):
+                        cls.verify_model_arch = classmethod(lambda c, model_arch: None)
+                    if not hasattr(cls, "is_pin_memory_available"):
+                        cls.is_pin_memory_available = classmethod(lambda c: False)
+                    if not hasattr(cls, "inference_mode"):
+                        import torch
+                        cls.inference_mode = classmethod(lambda c: torch.no_grad())
+                    if not hasattr(cls, "get_attn_backend_cls"):
+                        cls.get_attn_backend_cls = classmethod(lambda c, selected, selector: "")
+                    if not hasattr(cls, "get_device_total_memory"):
+                        cls.get_device_total_memory = classmethod(lambda c, device_id=0: 16 * 1024 * 1024 * 1024)
+                    if not hasattr(cls, "get_device_name"):
+                        cls.get_device_name = classmethod(lambda c, device_id=0: "Apple Silicon (MLX)")
+                    if not hasattr(cls, "set_device"):
+                        cls.set_device = classmethod(lambda c, device: None)
+                    if not hasattr(cls, "get_current_memory_usage"):
+                        cls.get_current_memory_usage = classmethod(lambda c, device=None: 0.0)
+                    if not hasattr(cls, "check_max_model_len"):
+                        cls.check_max_model_len = classmethod(lambda c, max_model_len: max_model_len)
+                    if not hasattr(cls, "use_sync_weight_loader"):
+                        cls.use_sync_weight_loader = classmethod(lambda c: False)
+                    if not hasattr(cls, "opaque_attention_op"):
+                        cls.opaque_attention_op = classmethod(lambda c: False)
+                    if not hasattr(cls, "get_lora_vocab_padding_size"):
+                        cls.get_lora_vocab_padding_size = classmethod(lambda c: 256)
+                    if not hasattr(cls, "get_device_uuid"):
+                        cls.get_device_uuid = classmethod(lambda c, device_id=0: "mlx-uuid")
+                    if not hasattr(cls, "support_hybrid_kv_cache"):
+                        cls.support_hybrid_kv_cache = classmethod(lambda c: False)
+                    if not hasattr(cls, "support_static_graph_mode"):
+                        cls.support_static_graph_mode = classmethod(lambda c: False)
+                    for plat in ["cuda", "rocm", "tpu", "xpu", "cpu", "out_of_tree"]:
+                        if not hasattr(cls, f"is_{plat}"):
+                            setattr(cls, f"is_{plat}", classmethod(lambda c: False))
+                    if not hasattr(cls, "fp8_dtype"):
+                        import torch
+                        cls.fp8_dtype = classmethod(lambda c: torch.float8_e4m3fn)
+                    if not hasattr(cls, "is_fp8_fnuz"):
+                        cls.is_fp8_fnuz = classmethod(lambda c: False)
+                    if not hasattr(cls, "supports_fp8"):
+                        cls.supports_fp8 = classmethod(lambda c: False)
+                    if not hasattr(cls, "supports_mx"):
+                        cls.supports_mx = classmethod(lambda c: False)
+                except (ImportError, AttributeError):
+                    pass
+
+                kwargs: Dict[str, Any] = {
+                    "model": self.model_path,
+                    "tokenizer": self.model_path,
+                    "dtype": self.dtype,
+                    "tensor_parallel_size": self.tensor_parallel_size,
+                    "trust_remote_code": self.trust_remote_code,
+                    "enforce_eager": self.enforce_eager,
+                    "gpu_memory_utilization": self.gpu_memory_utilization,
+                }
+                if self.max_model_len > 0:
+                    kwargs["max_model_len"] = self.max_model_len
+
+                engine = LLM(**kwargs)
+                VLLMTranslatorBackend._engine_cache[cache_key] = engine
+                return engine
             except Exception as exc:  # noqa: BLE001
+                vllm_error = exc
+                # If vLLM fails on macOS/MLX for any reason, fallback to mlx-lm if available
+                # This catches the XFORMERS validation error, segfaults, and other flakes.
+                try:
+                    from mlx_lm import load, generate
+                    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+                    class _DummyOutput:
+                        def __init__(self, text: str) -> None:
+                            self.text = text
+
+                    class _DummyRequestOutput:
+                        def __init__(self, text: str) -> None:
+                            self.outputs = [_DummyOutput(text)]
+
+                    class MLXLMAdapter:
+                        def __init__(self, model_path):
+                            self.model, self.tokenizer = load(model_path)
+
+                        def generate(self, prompts, sampling_params, use_tqdm=False):
+                            sampler = make_sampler(
+                                temp=float(getattr(sampling_params, "temperature", 0.0) or 0.0),
+                                top_p=float(getattr(sampling_params, "top_p", 1.0) or 1.0),
+                            )
+                            repetition_penalty = float(
+                                getattr(sampling_params, "repetition_penalty", 1.0) or 1.0
+                            )
+                            logits_processors = make_logits_processors(
+                                repetition_penalty=(
+                                    repetition_penalty if abs(repetition_penalty - 1.0) > 1e-6 else None
+                                )
+                            )
+                            results = []
+                            for p in prompts:
+                                txt = generate(
+                                    self.model,
+                                    self.tokenizer,
+                                    prompt=p,
+                                    max_tokens=int(getattr(sampling_params, "max_tokens", 256) or 256),
+                                    verbose=False,
+                                    sampler=sampler,
+                                    logits_processors=logits_processors,
+                                )
+                                results.append(_DummyRequestOutput(txt))
+                            return results
+
+                    engine = MLXLMAdapter(self.model_path)
+                    VLLMTranslatorBackend._engine_cache[cache_key] = engine
+                    return engine
+                except Exception as mlx_exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"vLLM initialization failed ({vllm_error}). "
+                        f"MLX fallback failed ({mlx_exc})."
+                    ) from mlx_exc
+
                 raise RuntimeError(
-                    "vLLM translator backend requires `vllm` in the active environment."
-                ) from exc
-
-            kwargs: Dict[str, Any] = {
-                "model": self.model_path,
-                "tokenizer": self.model_path,
-                "dtype": self.dtype,
-                "tensor_parallel_size": self.tensor_parallel_size,
-                "trust_remote_code": self.trust_remote_code,
-                "enforce_eager": self.enforce_eager,
-                "gpu_memory_utilization": self.gpu_memory_utilization,
-            }
-            if self.max_model_len > 0:
-                kwargs["max_model_len"] = self.max_model_len
-
-            engine = LLM(**kwargs)
-            VLLMTranslatorBackend._engine_cache[cache_key] = engine
-            return engine
+                    f"vLLM initialization failed ({vllm_error}). "
+                    "Ensure vLLM and vllm-mlx are compatible or install mlx-lm as a fallback."
+                ) from vllm_error
 
     def _sampling_params(self):
         try:
@@ -204,7 +328,9 @@ class VLLMTranslatorBackend(TranslatorBackend):
         if not self.debug_translation:
             return
         payload = dict(event)
-        for key in ("prompt", "response", "source", "translation"):
+        payload.pop("prompt", None)
+        payload.pop("response", None)
+        for key in ("source", "translation"):
             val = payload.get(key)
             if isinstance(val, str) and len(val) > self.debug_preview_chars:
                 payload[key] = val[: self.debug_preview_chars] + "... <truncated>"

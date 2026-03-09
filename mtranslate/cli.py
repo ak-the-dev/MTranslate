@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .constants import STAGES
+from .constants import ALLOWED_EXPORT_FORMATS
 from .model_manager import (
     DEFAULT_INPAINT_REPO,
     DEFAULT_TRANSLATE_REPO,
@@ -20,11 +20,40 @@ from .model_manager import (
     pull_translate_model,
 )
 from .ocr_backends import _select_model_files
-from .pipeline import PipelineRunner, load_manifest, retry_job, summarize_manifest
+from .paths import models_dir
+from .pipeline import PipelineRunner, audit_job, load_manifest, summarize_manifest
 
 
 def _repo_root() -> str:
     return os.getcwd()
+
+
+def _parse_exports(value: str) -> list[str]:
+    exports = [x.strip().lower() for x in value.split(",") if x.strip()]
+    if not exports:
+        raise ValueError("At least one export format is required")
+    unsupported = sorted({x for x in exports if x not in ALLOWED_EXPORT_FORMATS})
+    if unsupported:
+        allowed = ",".join(sorted(ALLOWED_EXPORT_FORMATS))
+        raise ValueError(f"Unsupported export format(s): {', '.join(unsupported)}. Allowed: {allowed}")
+    return exports
+
+
+def _default_translate_model_ref() -> str:
+    override = os.getenv("MTRANSLATE_VLLM_MODEL", "").strip()
+    if override:
+        return override
+
+    root = models_dir()
+    candidates = [
+        root / "mlx_community_gemma_3_4b_it_qat_4bit",
+        root / "translator_llm_mlx",
+        root / "translator_llm_vllm",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return DEFAULT_TRANSLATE_VLLM_REPO
 
 
 def cmd_models_pull(args: argparse.Namespace) -> int:
@@ -337,27 +366,13 @@ def cmd_models_verify_vllm(args: argparse.Namespace) -> int:
         messages.append(f"Running smoke test with model: {model}")
         smoke_code = (
             "import sys\n"
-            "from vllm import LLM, SamplingParams\n"
+            "from mtranslate.translator_backends import VLLMTranslatorBackend\n"
             "model = sys.argv[1]\n"
-            "dtype = sys.argv[2]\n"
-            "gpu_util = float(sys.argv[3])\n"
-            "max_model_len = int(sys.argv[4])\n"
-            "engine = LLM(\n"
-            "    model=model,\n"
-            "    tokenizer=model,\n"
-            "    dtype=dtype,\n"
-            "    tensor_parallel_size=1,\n"
-            "    enforce_eager=True,\n"
-            "    gpu_memory_utilization=gpu_util,\n"
-            "    max_model_len=max_model_len,\n"
+            "backend = VLLMTranslatorBackend(glossary={}, model_path=model)\n"
+            "text = backend.translate(\n"
+            "    '\\u304a\\u306f\\u3088\\u3046\\u3054\\u3056\\u3044\\u307e\\u3059\\u3002',\n"
+            "    {'prev': [], 'next': [], 'history': [], 'role': 'dialogue', 'orientation': 'horizontal'},\n"
             ")\n"
-            "sampling = SamplingParams(temperature=0.0, max_tokens=32)\n"
-            "out = engine.generate(\n"
-            "    ['Translate Japanese to natural English:\\nJapanese: \\u304a\\u306f\\u3088\\u3046\\u3054\\u3056\\u3044\\u307e\\u3059\\u3002'],\n"
-            "    sampling_params=sampling,\n"
-            "    use_tqdm=False,\n"
-            ")\n"
-            "text = (out[0].outputs[0].text or '').strip() if out and out[0].outputs else ''\n"
             "if not text:\n"
             "    raise RuntimeError('smoke output was empty')\n"
             "print(f'SMOKE_OUTPUT::{text}')\n"
@@ -366,15 +381,15 @@ def cmd_models_verify_vllm(args: argparse.Namespace) -> int:
             smoke_env = dict(os.environ)
             if plugin:
                 smoke_env["VLLM_PLUGINS"] = plugin
+            smoke_env["MTRANSLATE_VLLM_DTYPE"] = args.dtype
+            smoke_env["MTRANSLATE_VLLM_GPU_MEMORY_UTIL"] = str(args.gpu_memory_util)
+            smoke_env["MTRANSLATE_VLLM_MAX_MODEL_LEN"] = str(args.max_model_len)
             cp = subprocess.run(
                 [
                     sys.executable,
                     "-c",
                     smoke_code,
                     model,
-                    args.dtype,
-                    str(args.gpu_memory_util),
-                    str(args.max_model_len),
                 ],
                 text=True,
                 capture_output=True,
@@ -418,7 +433,7 @@ def cmd_models_verify_vllm(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    exports = [x.strip() for x in args.export.split(",") if x.strip()]
+    exports = _parse_exports(args.export)
     runner = PipelineRunner(
         input_path=args.input,
         output_path=args.output,
@@ -430,29 +445,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         font_path=args.font_path,
         repo_root=_repo_root(),
     )
-    manifest = runner.run(end_stage=args.until_stage)
+    manifest = runner.run()
     summary = summarize_manifest(manifest)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"manifest: {runner.manifest_file}")
     return 0 if manifest.status != "failed" else 2
-
-
-def cmd_create(args: argparse.Namespace) -> int:
-    exports = [x.strip() for x in args.export.split(",") if x.strip()]
-    runner = PipelineRunner(
-        input_path=args.input,
-        output_path=args.output,
-        export_formats=exports,
-        glossary_path=args.glossary,
-        pre_dict_path=args.pre_dict,
-        post_dict_path=args.post_dict,
-        max_workers=args.max_workers,
-        font_path=args.font_path,
-        repo_root=_repo_root(),
-    )
-    runner.save_manifest()
-    print(runner.job_id)
-    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -479,77 +476,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_retry(args: argparse.Namespace) -> int:
-    manifest = retry_job(
-        job_id=args.job,
-        pages_spec=args.pages,
-        stage=args.stage,
-        repo_root=_repo_root(),
-    )
-    summary = summarize_manifest(manifest)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if manifest.status == "done" else 2
-
-
-def _resolve_page_selection(manifest, page_arg: str | None, all_pages: bool) -> set[str]:
-    page_ids = sorted(manifest.pages.keys())
-    if all_pages:
-        return set(page_ids)
-
-    if not page_arg:
-        raise ValueError("Provide --page <page_id|index> or --all-pages")
-
-    if page_arg in manifest.pages:
-        return {page_arg}
-
-    if page_arg.isdigit():
-        idx = int(page_arg)
-        if idx < 1 or idx > len(page_ids):
-            raise ValueError(f"Page index out of range: {idx} (1..{len(page_ids)})")
-        return {page_ids[idx - 1]}
-
-    raise ValueError(f"Unknown page selection: {page_arg}")
-
-
-def cmd_step(args: argparse.Namespace) -> int:
-    if args.page and args.all_pages:
-        raise ValueError("Use either --page or --all-pages, not both")
-    runner = PipelineRunner.from_job(job_id=args.job, repo_root=_repo_root())
-    selected = _resolve_page_selection(runner.manifest, args.page, args.all_pages)
-    manifest = runner.run(
-        selected_pages=selected,
-        start_stage=args.stage,
-        end_stage=args.stage,
-        force=True,
-    )
-    summary = summarize_manifest(manifest)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if manifest.status != "failed" else 2
-
-
-def cmd_review(args: argparse.Namespace) -> int:
-    runner = PipelineRunner.from_job(job_id=args.job, repo_root=_repo_root())
-    if args.apply:
-        manifest = runner.apply_review_edits(args.apply)
-        print(json.dumps(summarize_manifest(manifest), ensure_ascii=False, indent=2))
-        return 0 if manifest.status == "done" else 2
-
-    manifest = runner.manifest
-    print(f"Review artifacts: {runner.paths['review']}")
-    for page_id in sorted(manifest.pages):
-        page = manifest.pages[page_id]
-        if page.output_paths.get("review"):
-            print(f"- {page_id}: {page.output_paths['review']}")
-    print("To apply edits: mtranslate review --job <job_id> --apply <edits.json>")
-    print(
-        "Edit format: "
-        '{"pages":{"001":{"regions":[{"region_id":"ocr_0","enabled":false}],"blocks":[{"region_id":"ocr_1","text":"...","bbox":[x,y,w,h],"font_size":24}]}}}'
-    )
-    return 0
+def cmd_audit(args: argparse.Namespace) -> int:
+    report = audit_job(args.job)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report.get("checks", {}).get("ok") else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="mtranslate", description="Offline manga translation pipeline")
+    parser = argparse.ArgumentParser(prog="mtranslate", description="Fully automated offline manga translation pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
 
     models = sub.add_parser("models", help="Model management")
@@ -587,7 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_vllm = models_sub.add_parser("verify-vllm", help="Verify vLLM installation")
     verify_vllm.add_argument(
         "--model",
-        default=(os.getenv("MTRANSLATE_VLLM_MODEL", "").strip() or DEFAULT_TRANSLATE_VLLM_REPO),
+        default=_default_translate_model_ref(),
         help="Model path or Hugging Face model id for smoke test",
     )
     verify_vllm.add_argument("--smoke", action="store_true", help="Run one generation smoke test")
@@ -611,42 +545,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--export", default="folder,pdf", help="Comma-separated: folder,pdf")
     run.add_argument("--max-workers", type=int, default=None)
     run.add_argument("--font-path", default=None)
-    run.add_argument("--until-stage", default=None, choices=STAGES, help="Stop after this stage")
     run.set_defaults(func=cmd_run)
-
-    create = sub.add_parser("create", help="Create a job manifest without running stages")
-    create.add_argument("--input", required=True, help="Input image folder")
-    create.add_argument("--output", required=True, help="Output folder")
-    create.add_argument("--glossary", default=None, help="Glossary yaml path")
-    create.add_argument("--pre-dict", default=None, help="Regex replacement dictionary applied before translation")
-    create.add_argument("--post-dict", default=None, help="Regex replacement dictionary applied after translation")
-    create.add_argument("--export", default="folder,pdf", help="Comma-separated: folder,pdf")
-    create.add_argument("--max-workers", type=int, default=None)
-    create.add_argument("--font-path", default=None)
-    create.set_defaults(func=cmd_create)
 
     status = sub.add_parser("status", help="Job status")
     status.add_argument("--job", required=True, help="Job id")
     status.add_argument("--json", action="store_true")
     status.set_defaults(func=cmd_status)
 
-    retry = sub.add_parser("retry", help="Retry failed pages/stage")
-    retry.add_argument("--job", required=True)
-    retry.add_argument("--pages", required=True, help="Page ranges (1,3-5)")
-    retry.add_argument("--stage", required=True)
-    retry.set_defaults(func=cmd_retry)
-
-    step = sub.add_parser("step", help="Run exactly one pipeline stage")
-    step.add_argument("--job", required=True, help="Job id")
-    step.add_argument("--stage", required=True, choices=STAGES, help="Stage to execute")
-    step.add_argument("--page", default=None, help="Page id (e.g. 001) or 1-based index")
-    step.add_argument("--all-pages", action="store_true", help="Run this stage for all pages")
-    step.set_defaults(func=cmd_step)
-
-    review = sub.add_parser("review", help="Review artifacts and apply edits")
-    review.add_argument("--job", required=True)
-    review.add_argument("--apply", default=None, help="JSON edits file")
-    review.set_defaults(func=cmd_review)
+    audit = sub.add_parser("audit", help="Audit a completed or in-progress job for manifest/output integrity")
+    audit.add_argument("--job", required=True, help="Job id")
+    audit.set_defaults(func=cmd_audit)
 
     return parser
 

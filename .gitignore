@@ -5,12 +5,10 @@ __pycache__/
 
 .venv/
 .venv_local/
+.vscode/
 .mtranslate_data/
 .mtranslate_data_runtime/
 outputs/
 models/
-ui/**/.build/
-ui/**/.swiftpm/
-ui/**/Package.resolved
 
 *.log

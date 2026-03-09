@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mtranslate"
 version = "0.1.0"
-description = "Offline-first manga translation pipeline for macOS"
+description = "Offline-first automated manga translation pipeline"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{name = "MTranslate"}]

@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .constants import APP_NAME
-
 
 def app_support_dir() -> Path:
     base = os.getenv("MTRANSLATE_APP_SUPPORT")
@@ -36,7 +34,7 @@ def job_dir(job_id: str) -> Path:
     return path
 
 
-def ensure_job_tree(job_id: str) -> dict:
+def ensure_job_tree(job_id: str) -> dict[str, Path]:
     root = job_dir(job_id)
     paths = {
         "root": root,
@@ -46,7 +44,6 @@ def ensure_job_tree(job_id: str) -> dict:
         "masks": root / "work" / "masks",
         "inpaint": root / "work" / "inpaint",
         "typeset": root / "work" / "typeset",
-        "review": root / "review",
         "logs": root / "logs",
         "exports": root / "exports",
     }

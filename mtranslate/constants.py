@@ -21,6 +21,7 @@ TERMINAL_STATUSES = {"done", "failed", "cancelled"}
 PAGE_STATUSES = {"pending", "running", "done", "failed", "skipped"}
 
 DEFAULT_EXPORT = ("folder", "pdf")
+ALLOWED_EXPORT_FORMATS = {"folder", "pdf"}
 
 DEFAULT_GLOSSARY = {
     "characters": {},

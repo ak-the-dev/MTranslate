@@ -1,54 +1,118 @@
-"""Native macOS helper integrations."""
+"""Cross-platform Python native helpers."""
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
-import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 
-class NativeToolError(RuntimeError):
-    pass
+def _load_font(font_path: str | None, size: int):
+    try:
+        from PIL import ImageFont  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("typeset requires Pillow") from exc
+    if font_path:
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
 
 
-def _swift_env() -> dict:
-    env = dict(os.environ)
-    env.setdefault("SWIFT_MODULECACHE_PATH", "/tmp/swift-module-cache")
-    env.setdefault("CLANG_MODULE_CACHE_PATH", "/tmp/clang-module-cache")
-    return env
+def _wrap_text(draw, text: str, font, max_width: int) -> List[str]:
+    cleaned = " ".join((text or "").strip().split())
+    if not cleaned:
+        return []
+    if max_width <= 8:
+        return [cleaned]
 
+    if " " in cleaned:
+        tokens: Iterable[str] = cleaned.split(" ")
+    else:
+        tokens = list(cleaned)
 
-def _run_swift(script: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="mtranslate_native_") as td:
-        req = Path(td) / "request.json"
-        res = Path(td) / "response.json"
-        req.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        cmd = ["swift", script, str(req), str(res)]
-        cp = subprocess.run(cmd, text=True, capture_output=True, env=_swift_env(), check=False)
-        if cp.returncode != 0:
-            raise NativeToolError(cp.stderr.strip() or cp.stdout.strip() or "swift helper failed")
-        return json.loads(res.read_text(encoding="utf-8"))
-
-
-def native_ocr_batch(image_paths: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-    script = str(Path(__file__).with_name("native_tools.swift"))
-    payload = {"command": "ocr", "images": image_paths}
-    out = _run_swift(script, payload)
-    return out.get("regions", {})
+    lines: List[str] = []
+    current = ""
+    for token in tokens:
+        candidate = f"{current} {token}".strip() if " " in cleaned else (current + token)
+        width = draw.textbbox((0, 0), candidate, font=font)[2]
+        if current and width > max_width:
+            lines.append(current)
+            current = token
+            continue
+        current = candidate
+    if current:
+        lines.append(current)
+    return lines or [cleaned]
 
 
 def native_typeset_batch(tasks: List[Dict[str, Any]], font_path: str | None) -> None:
-    script = str(Path(__file__).with_name("native_tools.swift"))
-    payload: Dict[str, Any] = {"command": "typeset", "tasks": tasks}
-    if font_path:
-        payload["font_path"] = font_path
-    _run_swift(script, payload)
+    try:
+        from PIL import Image, ImageDraw  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("typeset requires Pillow") from exc
+
+    for task in tasks:
+        src = str(task.get("input", ""))
+        dst = str(task.get("output", ""))
+        if not src or not dst:
+            raise RuntimeError("typeset task missing input or output path")
+
+        image = Image.open(src).convert("RGBA")
+        draw = ImageDraw.Draw(image)
+        for block in task.get("blocks", []) or []:
+            text = str(block.get("text", "")).strip()
+            if not text:
+                continue
+            bbox = block.get("bbox") or [0, 0, 1, 1]
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            x, y, w, h = [int(v) for v in bbox]
+            w = max(1, w)
+            h = max(1, h)
+            font_size = max(6, int(block.get("font_size", max(10, int(min(w, h) * 0.2)))))
+            font = _load_font(font_path, font_size)
+            line_spacing = max(0.9, float(block.get("line_spacing", 1.15)))
+            align = str(block.get("align", "center")).lower().strip()
+
+            lines = _wrap_text(draw, text, font, max_width=max(8, w - 4))
+            line_heights = []
+            for ln in lines:
+                tb = draw.textbbox((0, 0), ln, font=font)
+                line_heights.append(max(1, tb[3] - tb[1]))
+            text_height = int(sum(line_heights) + max(0, len(lines) - 1) * font_size * (line_spacing - 1.0))
+            cursor_y = y + max(0, (h - text_height) // 2)
+
+            for idx, ln in enumerate(lines):
+                tb = draw.textbbox((0, 0), ln, font=font)
+                line_width = max(1, tb[2] - tb[0])
+                if align == "left":
+                    cursor_x = x + 2
+                elif align == "right":
+                    cursor_x = x + max(0, w - line_width - 2)
+                else:
+                    cursor_x = x + max(0, (w - line_width) // 2)
+                draw.text((cursor_x, cursor_y), ln, fill=(0, 0, 0, 255), font=font)
+                cursor_y += int(line_heights[idx] * line_spacing)
+
+        dst_path = Path(dst)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(dst_path)
 
 
 def native_images_to_pdf(images: List[str], output_pdf: str) -> None:
-    script = str(Path(__file__).with_name("native_tools.swift"))
-    payload = {"command": "images_to_pdf", "images": images, "output": output_pdf}
-    _run_swift(script, payload)
+    try:
+        from PIL import Image  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("PDF export requires Pillow") from exc
+
+    if not images:
+        raise RuntimeError("No images available to export PDF")
+    opened = [Image.open(path).convert("RGB") for path in images]
+    output = Path(output_pdf)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    head, rest = opened[0], opened[1:]
+    head.save(output, save_all=True, append_images=rest)
+    for img in opened:
+        img.close()

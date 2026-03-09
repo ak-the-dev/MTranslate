@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .native import native_ocr_batch
+from .env import env_float, env_int
 
 
 @dataclass
@@ -48,10 +48,20 @@ def _get_paddle_ocr():
         optional_kwargs: Dict[str, Any] = {}
         detection_size = os.getenv("MTRANSLATE_OCR_DETECTION_SIZE", "").strip()
         if detection_size:
-            optional_kwargs["text_det_limit_side_len"] = int(detection_size)
+            optional_kwargs["text_det_limit_side_len"] = env_int(
+                "MTRANSLATE_OCR_DETECTION_SIZE",
+                1536,
+                min_value=64,
+                max_value=8192,
+            )
         unclip_ratio = os.getenv("MTRANSLATE_OCR_UNCLIP_RATIO", "").strip()
         if unclip_ratio:
-            optional_kwargs["det_db_unclip_ratio"] = float(unclip_ratio)
+            optional_kwargs["det_db_unclip_ratio"] = env_float(
+                "MTRANSLATE_OCR_UNCLIP_RATIO",
+                1.5,
+                min_value=0.5,
+                max_value=5.0,
+            )
 
         try:
             _PADDLE_OCR_INSTANCE = PaddleOCR(
@@ -111,8 +121,8 @@ def _region_from_quad(idx: int, text: str, score: float, points: List[List[float
 
 
 def _ocr_thresholds() -> tuple[float, int]:
-    min_score = float(os.getenv("MTRANSLATE_OCR_MIN_SCORE", "0.6"))
-    min_side = int(os.getenv("MTRANSLATE_OCR_MIN_SIDE", "12"))
+    min_score = env_float("MTRANSLATE_OCR_MIN_SCORE", 0.6, min_value=0.0, max_value=1.0)
+    min_side = env_int("MTRANSLATE_OCR_MIN_SIDE", 12, min_value=1, max_value=1024)
     return min_score, min_side
 
 
@@ -217,7 +227,9 @@ def extract_regions_batch(image_paths: List[str]) -> OCRResult:
     backend = os.getenv("MTRANSLATE_OCR_BACKEND", "paddle").strip().lower()
 
     if backend in {"vision", "native"}:
-        return OCRResult(by_path=native_ocr_batch(image_paths), backend="vision")
+        raise ValueError(
+            "OCR backend 'vision' is not available in this branch. Supported: paddle, fastdeploy"
+        )
 
     if backend in {"paddlefast", "fastdeploy", "fastdeploy_paddle"}:
         root = Path(os.getenv("MTRANSLATE_FASTDEPLOY_MODELS", "")).expanduser()
@@ -231,4 +243,4 @@ def extract_regions_batch(image_paths: List[str]) -> OCRResult:
     if backend == "paddle":
         return OCRResult(by_path=_run_paddleocr(image_paths), backend="paddleocr")
 
-    raise ValueError(f"Unknown OCR backend: {backend}. Supported: paddle, fastdeploy, vision")
+    raise ValueError(f"Unknown OCR backend: {backend}. Supported: paddle, fastdeploy")
